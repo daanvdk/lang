@@ -4,6 +4,8 @@ pub const Token = struct {
 
     pub const Type = enum {
         num,
+        bool,
+        null,
 
         space,
         newline,

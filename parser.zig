@@ -51,6 +51,10 @@ const Parser = struct {
     fn parseLit(self: *Parser) Error!Expr {
         if (self.peek(&.{.num})) {
             return try self.parseNum();
+        } else if (self.peek(&.{.bool})) {
+            return try self.parseBool();
+        } else if (self.peek(&.{.null})) {
+            return try self.parseNull();
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -61,6 +65,17 @@ const Parser = struct {
         const token = try self.expect(&.{.num});
         const value = std.fmt.parseFloat(f64, token.content) catch return error.ParseError;
         return .{ .num = value };
+    }
+
+    fn parseBool(self: *Parser) Error!Expr {
+        const token = try self.expect(&.{.bool});
+        const value = std.mem.eql(u8, token.content, "true");
+        return .{ .bool = value };
+    }
+
+    fn parseNull(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.null});
+        return .null;
     }
 
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
@@ -131,8 +146,32 @@ const Body = struct {
     end: Token,
 };
 
-test "parse num" {
+test "parse num 1" {
     const expr = try parse(std.testing.allocator, "1337");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .num = 1337 }, expr);
+}
+
+test "parse num 2" {
+    const expr = try parse(std.testing.allocator, "45.67");
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .num = 45.67 }, expr);
+}
+
+test "parse bool 1" {
+    const expr = try parse(std.testing.allocator, "true");
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .bool = true }, expr);
+}
+
+test "parse bool 2" {
+    const expr = try parse(std.testing.allocator, "false");
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .bool = false }, expr);
+}
+
+test "parse null" {
+    const expr = try parse(std.testing.allocator, "null");
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr.null, expr);
 }

@@ -48,6 +48,28 @@ pub const Lexer = struct {
     fn nextKnownType(self: *Lexer) ?Token.Type {
         const char0 = self.nextChar() orelse return .eof;
         switch (char0) {
+            'A'...'Z', 'a'...'z', '_' => {
+                const start = self.index - 1;
+                while (self.nextChar()) |char1| {
+                    switch (char1) {
+                        'A'...'Z', 'a'...'z', '0'...'9', '_' => {},
+                        else => {
+                            self.pushChar(char1);
+                            break;
+                        },
+                    }
+                }
+
+                const content = self.content[start..self.index];
+                inline for (@typeInfo(@TypeOf(keywords)).Struct.fields) |field| {
+                    inline for (@field(keywords, field.name)) |keyword| {
+                        if (std.mem.eql(u8, content, keyword)) return @field(Token.Type, field.name);
+                    }
+                }
+
+                self.index = start;
+                return null;
+            },
             '0'...'9' => {
                 var has_decimal = false;
                 while (self.nextChar()) |char1| {
@@ -134,5 +156,10 @@ pub const Lexer = struct {
     pub const Pos = struct {
         line: usize,
         column: usize,
+    };
+
+    const keywords = .{
+        .bool = .{ "true", "false" },
+        .null = .{"null"},
     };
 };

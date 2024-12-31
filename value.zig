@@ -4,6 +4,8 @@ const Instr = @import("instr.zig").Instr;
 
 pub const Value = union(enum) {
     num: f64,
+    bool: bool,
+    null,
     obj: *Obj,
 
     pub const Obj = struct {

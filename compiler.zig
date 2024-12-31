@@ -31,8 +31,8 @@ const Compiler = struct {
 
     fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
         switch (expr) {
-            .num => |value| {
-                try self.instrs.append(.{ .num = value });
+            inline .num, .bool, .null => |value, tag| {
+                try self.instrs.append(@unionInit(Instr, @tagName(tag), value));
                 try self.compileUsage(usage);
                 return .any;
             },
@@ -49,12 +49,52 @@ const Compiler = struct {
 const Usage = enum { returned };
 const Info = enum { any };
 
-test "compile num" {
+test "compile num 1" {
     const program = try compile(std.testing.allocator, .{ .num = 1337 });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
         .{ .num = 1337 },
+        .ret,
+    }, program.instrs);
+}
+
+test "compile num 2" {
+    const program = try compile(std.testing.allocator, .{ .num = 45.67 });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .num = 45.67 },
+        .ret,
+    }, program.instrs);
+}
+
+test "compile bool 1" {
+    const program = try compile(std.testing.allocator, .{ .bool = true });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .bool = true },
+        .ret,
+    }, program.instrs);
+}
+
+test "compile bool 2" {
+    const program = try compile(std.testing.allocator, .{ .bool = false });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .bool = false },
+        .ret,
+    }, program.instrs);
+}
+
+test "compile null" {
+    const program = try compile(std.testing.allocator, .null);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .null,
         .ret,
     }, program.instrs);
 }

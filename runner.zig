@@ -66,8 +66,8 @@ const Runner = struct {
             const instr = ip[0];
             ip += 1;
             switch (instr) {
-                .num => |value| {
-                    try call.stack.append(self.allocator, .{ .num = value });
+                inline .num, .bool, .null => |value, tag| {
+                    try call.stack.append(self.allocator, @unionInit(Value, @tagName(tag), value));
                 },
                 .ret => {
                     return call.stack.pop();
@@ -83,17 +83,17 @@ const Runner = struct {
     };
 };
 
-fn cloneProgram(allocater: std.mem.Allocator, program: Program) !Program {
+fn cloneProgram(program: Program) !Program {
     return .{
-        .instrs = try allocater.dupe(Instr, program.instrs),
+        .instrs = try std.testing.allocator.dupe(Instr, program.instrs),
     };
 }
 
-test "run num" {
+test "run num 1" {
     var runner = Runner.init(std.testing.allocator);
     defer runner.deinit();
 
-    const program = try cloneProgram(std.testing.allocator, .{
+    const program = try cloneProgram(.{
         .instrs = &.{
             .{ .num = 1337 },
             .ret,
@@ -102,4 +102,64 @@ test "run num" {
     const value = try runner.runProgram(program);
 
     try std.testing.expectEqualDeep(Value{ .num = 1337 }, value);
+}
+
+test "run num 2" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .num = 45.67 },
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 45.67 }, value);
+}
+
+test "run bool 1" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .bool = true },
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .bool = true }, value);
+}
+
+test "run bool 2" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .bool = false },
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .bool = false }, value);
+}
+
+test "run null" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .null,
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value.null, value);
 }
