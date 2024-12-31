@@ -458,3 +458,37 @@ test "run lambda" {
 
     try std.testing.expectEqualDeep(Value{ .num = 16 }, value);
 }
+
+test "run closure" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .num = 2 },
+            .{ .local = 0 },
+            .{ .lambda = .{ .caps = 1, .len = 13 } },
+            .{ .local = 1 },
+            .{ .jmp_if = 2 },
+            .{ .pop = 1 },
+            .no_match,
+            .decons,
+            .{ .jmp_if = 1 },
+            .{ .jmp = 2 },
+            .{ .pop = 1 },
+            .no_match,
+            .{ .local = 1 },
+            .{ .local = 0 },
+            .mul,
+            .ret,
+            .{ .local = 1 },
+            .{ .num = 4 },
+            .nil,
+            .cons,
+            .tail_call,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 8 }, value);
+}

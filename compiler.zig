@@ -18,6 +18,8 @@ pub fn compile(allocator: std.mem.Allocator, expr: Expr) Compiler.Error!Program 
 const Compiler = struct {
     instrs: std.ArrayList(Instr),
     stack: Stack,
+    scope: std.StringHashMap(Info),
+    caps: std.ArrayList(Cap),
 
     const Error = std.mem.Allocator.Error || error{CompileError};
 
@@ -25,12 +27,16 @@ const Compiler = struct {
         return .{
             .instrs = std.ArrayList(Instr).init(allocator),
             .stack = Stack.init(allocator),
+            .scope = std.StringHashMap(Info).init(allocator),
+            .caps = std.ArrayList(Cap).init(allocator),
         };
     }
 
     fn deinit(self: *Compiler) void {
         self.instrs.deinit();
         self.stack.deinit();
+        self.scope.deinit();
+        self.caps.deinit();
     }
 
     fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
@@ -40,6 +46,19 @@ const Compiler = struct {
                 if (self.stack.get(name)) |local| {
                     try self.instrs.append(.{ .local = local.index });
                     info = local.info;
+                } else if (self.scope.get(name)) |info_| {
+                    try self.caps.append(.{
+                        .index = self.instrs.items.len,
+                        .name = name,
+                    });
+                    try self.instrs.append(.null);
+                    info = info_;
+                } else inline for (@typeInfo(Instr.Global).Enum.fields) |field| {
+                    if (std.mem.eql(u8, name, field.name)) {
+                        try self.instrs.append(.{ .global = @field(Instr.Global, field.name) });
+                        info = .any;
+                        break;
+                    }
                 } else {
                     std.debug.print("unknown name: {s}\n", .{name});
                     return error.CompileError;
@@ -74,11 +93,39 @@ const Compiler = struct {
                 var compiler = Compiler.init(self.instrs.allocator);
                 defer compiler.deinit();
 
+                compiler.scope = try self.scope.clone();
+                for (self.stack.entries.items) |maybe_entry| {
+                    const entry = maybe_entry orelse continue;
+                    try compiler.scope.put(entry.name, entry.info);
+                }
+
                 try compiler.compilePattern(matcher.pattern, .list, 0);
                 _ = try compiler.compileExpr(matcher.expr, .returned);
 
+                var caps = std.StringHashMap(usize).init(self.instrs.allocator);
+                defer caps.deinit();
+
+                for (compiler.caps.items) |cap| {
+                    const res = try caps.getOrPut(cap.name);
+                    if (res.found_existing) continue;
+
+                    _ = try self.compileExpr(.{ .name = cap.name }, .used);
+                    res.value_ptr.* = caps.count() - 1;
+                }
+
+                for (compiler.instrs.items) |*instr| {
+                    switch (instr.*) {
+                        .local, .pop => |*i| i.* += caps.count(),
+                        else => {},
+                    }
+                }
+
+                for (compiler.caps.items) |cap| {
+                    compiler.instrs.items[cap.index] = .{ .local = caps.get(cap.name).? };
+                }
+
                 try self.instrs.append(.{ .lambda = .{
-                    .caps = 0,
+                    .caps = caps.count(),
                     .len = @truncate(compiler.instrs.items.len),
                 } });
                 try self.instrs.appendSlice(compiler.instrs.items);
@@ -408,6 +455,11 @@ const Stack = struct {
     };
 };
 
+const Cap = struct {
+    index: usize,
+    name: []const u8,
+};
+
 test "compile num 1" {
     const program = try compile(std.testing.allocator, .{ .num = 1337 });
     defer program.deinit(std.testing.allocator);
@@ -545,6 +597,60 @@ test "compile lambda" {
         .mul,
         .ret,
         .{ .local = 0 },
+        .{ .num = 4 },
+        .nil,
+        .cons,
+        .tail_call,
+    }, program.instrs);
+}
+
+test "compile closure" {
+    const program = try compile(std.testing.allocator, .{ .match = &.{
+        .subject = .{ .num = 2 },
+        .matchers = &.{.{
+            .pattern = .{ .name = "n" },
+            .expr = .{ .match = &.{
+                .subject = .{ .lambda = &.{
+                    .pattern = .{ .list = &.{
+                        .{ .name = "x" },
+                    } },
+                    .expr = .{ .mul = &.{
+                        .lhs = .{ .name = "x" },
+                        .rhs = .{ .name = "n" },
+                    } },
+                } },
+                .matchers = &.{.{
+                    .pattern = .{ .name = "times_n" },
+                    .expr = .{ .call = &.{
+                        .lhs = .{ .name = "times_n" },
+                        .rhs = .{ .list = &.{
+                            .{ .num = 4 },
+                        } },
+                    } },
+                }},
+            } },
+        }},
+    } });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .num = 2 },
+        .{ .local = 0 },
+        .{ .lambda = .{ .caps = 1, .len = 13 } },
+        .{ .local = 1 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 1 },
+        .no_match,
+        .decons,
+        .{ .jmp_if = 1 },
+        .{ .jmp = 2 },
+        .{ .pop = 1 },
+        .no_match,
+        .{ .local = 1 },
+        .{ .local = 0 },
+        .mul,
+        .ret,
+        .{ .local = 1 },
         .{ .num = 4 },
         .nil,
         .cons,

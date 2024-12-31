@@ -734,3 +734,38 @@ test "parse lambda" {
         }},
     } }, expr);
 }
+
+test "parse closure" {
+    const expr = try parse(std.testing.allocator, (
+        \\n = 2
+        \\times_n = |x| x * n
+        \\times_n(4)
+    ));
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .match = &.{
+        .subject = .{ .num = 2 },
+        .matchers = &.{.{
+            .pattern = .{ .name = "n" },
+            .expr = .{ .match = &.{
+                .subject = .{ .lambda = &.{
+                    .pattern = .{ .list = &.{
+                        .{ .name = "x" },
+                    } },
+                    .expr = .{ .mul = &.{
+                        .lhs = .{ .name = "x" },
+                        .rhs = .{ .name = "n" },
+                    } },
+                } },
+                .matchers = &.{.{
+                    .pattern = .{ .name = "times_n" },
+                    .expr = .{ .call = &.{
+                        .lhs = .{ .name = "times_n" },
+                        .rhs = .{ .list = &.{
+                            .{ .num = 4 },
+                        } },
+                    } },
+                }},
+            } },
+        }},
+    } }, expr);
+}
