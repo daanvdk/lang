@@ -1,9 +1,21 @@
 pub const Instr = union(enum) {
+    global: Global,
     local: usize,
     pop: usize,
     num: f64,
     bool: bool,
     null,
+
+    nil,
+    cons,
+    decons,
+    lambda: packed struct {
+        caps: u32,
+        len: u32,
+    },
+
+    call,
+    tail_call,
 
     pow,
     pos,
@@ -27,4 +39,8 @@ pub const Instr = union(enum) {
 
     ret,
     no_match,
+
+    pub const Global = enum {
+        is_list,
+    };
 };

@@ -101,6 +101,11 @@ pub const Lexer = struct {
                 return .num;
             },
 
+            '[' => return .llist,
+            ']' => return .rlist,
+            ',' => return .comma,
+            '|' => return .lambda,
+
             '(' => return .lpar,
             ')' => return .rpar,
 

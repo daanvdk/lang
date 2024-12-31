@@ -10,12 +10,12 @@ pub fn run(allocator: std.mem.Allocator, program: Program) Runner.Error!void {
     _ = try runner.runProgram(program);
 }
 
-const Runner = struct {
+pub const Runner = struct {
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(*Call) = .{},
     last: ?*Value.Obj = null,
 
-    const Error = std.mem.Allocator.Error || error{RunError};
+    pub const Error = std.mem.Allocator.Error || error{RunError};
 
     fn init(allocator: std.mem.Allocator) Runner {
         return .{ .allocator = allocator };
@@ -47,6 +47,11 @@ const Runner = struct {
         return detail;
     }
 
+    fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !Value {
+        const detail = try self.create(obj_type, data);
+        return detail.obj.toValue();
+    }
+
     fn runProgram(self: *Runner, program: Program) Error!Value {
         const program_ = self.create(.program, .{ .instrs = program.instrs }) catch |err| {
             program.deinit(self.allocator);
@@ -66,6 +71,12 @@ const Runner = struct {
             const instr = ip[0];
             ip += 1;
             switch (instr) {
+                .global => |global| {
+                    const value = switch (global) {
+                        inline else => |tag| Value{ .builtin = @field(Builtins, @tagName(tag)) },
+                    };
+                    try call.stack.append(self.allocator, value);
+                },
                 .local => |local| {
                     const value = call.stack.items[local];
                     try call.stack.append(self.allocator, value);
@@ -73,8 +84,78 @@ const Runner = struct {
                 .pop => |local| {
                     _ = call.stack.orderedRemove(local);
                 },
-                inline .num, .bool, .null => |value, tag| {
+                inline .num, .bool, .null, .nil => |value, tag| {
                     try call.stack.append(self.allocator, @unionInit(Value, @tagName(tag), value));
+                },
+
+                .cons => {
+                    const tail = try expectList(call.stack.pop());
+                    const head = call.stack.pop();
+                    const cons = try self.createValue(.cons, .{ .head = head, .tail = tail });
+                    try call.stack.append(self.allocator, cons);
+                },
+                .decons => {
+                    const cons = try expectCons(call.stack.pop());
+                    try call.stack.append(self.allocator, cons.head);
+                    try call.stack.append(self.allocator, Value.Cons.toValue(cons.tail));
+                },
+                .lambda => |lambda| {
+                    const stack_ = try self.allocator.alloc(Value, lambda.caps);
+                    const index = call.stack.items.len - lambda.caps;
+                    @memcpy(stack_, call.stack.items[index..]);
+                    call.stack.shrinkRetainingCapacity(index);
+
+                    const value = self.createValue(.lambda, .{
+                        .program = call.program,
+                        .offset = (@intFromPtr(ip) - @intFromPtr(call.program.instrs.ptr)) / @sizeOf(Instr),
+                        .stack = stack_,
+                    }) catch |err| {
+                        self.allocator.free(stack_);
+                        return err;
+                    };
+                    try call.stack.append(self.allocator, value);
+                    ip += lambda.len;
+                },
+
+                .call => {
+                    const args = try expectList(call.stack.pop());
+                    const value = switch (try expectCallable(call.stack.pop())) {
+                        .builtin => |builtin| try builtin(self, args),
+                        .lambda => |lambda| value: {
+                            var call_ = Call{
+                                .program = lambda.program,
+                                .offset = lambda.offset,
+                            };
+                            defer call_.stack.deinit(self.allocator);
+
+                            try call_.stack.ensureUnusedCapacity(self.allocator, lambda.stack.len + 1);
+                            call_.stack.appendSliceAssumeCapacity(lambda.stack);
+                            call_.stack.appendAssumeCapacity(Value.Cons.toValue(args));
+
+                            break :value try self.run(&call_);
+                        },
+                    };
+                    try call.stack.append(self.allocator, value);
+                },
+                .tail_call => {
+                    const args = try expectList(call.stack.pop());
+                    switch (try expectCallable(call.stack.pop())) {
+                        .builtin => |builtin| {
+                            call.stack.clearAndFree(self.allocator);
+                            return try builtin(self, args);
+                        },
+                        .lambda => |lambda| {
+                            call.program = lambda.program;
+                            call.offset = lambda.offset;
+
+                            call.stack.clearRetainingCapacity();
+                            try call.stack.ensureUnusedCapacity(self.allocator, lambda.stack.len + 1);
+                            call.stack.appendSliceAssumeCapacity(lambda.stack);
+                            call.stack.appendAssumeCapacity(Value.Cons.toValue(args));
+
+                            ip = call.program.instrs.ptr + call.offset;
+                        },
+                    }
                 },
 
                 .pow => {
@@ -170,10 +251,58 @@ const Runner = struct {
         };
     }
 
+    fn expectCons(value: Value) !*Value.Cons {
+        return switch (value) {
+            .obj => |obj| switch (obj.type) {
+                .cons => @fieldParentPtr("obj", obj),
+                else => error.RunError,
+            },
+            else => error.RunError,
+        };
+    }
+
+    fn expectList(value: Value) !?*Value.Cons {
+        return switch (value) {
+            .nil => null,
+            .obj => |obj| switch (obj.type) {
+                .cons => @fieldParentPtr("obj", obj),
+                else => error.RunError,
+            },
+            else => error.RunError,
+        };
+    }
+
+    fn expectCallable(value: Value) !Callable {
+        return switch (value) {
+            .builtin => |builtin| .{ .builtin = builtin },
+            .obj => |obj| switch (obj.type) {
+                .lambda => .{ .lambda = @fieldParentPtr("obj", obj) },
+                else => error.RunError,
+            },
+            else => error.RunError,
+        };
+    }
+
+    const Callable = union(enum) {
+        builtin: *const fn (*Runner, ?*Value.Cons) Error!Value,
+        lambda: *Value.Lambda,
+    };
+
     const Call = struct {
         program: *Value.Program,
         offset: usize,
         stack: std.ArrayListUnmanaged(Value) = .{},
+    };
+
+    const Builtins = struct {
+        fn is_list(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = switch (arg) {
+                .nil => true,
+                .obj => |obj| obj.type == .cons,
+                else => false,
+            } };
+        }
     };
 };
 
@@ -280,7 +409,7 @@ test "run operators" {
     try std.testing.expectEqualDeep(Value{ .num = 1.25 }, value);
 }
 
-test "compile var" {
+test "run var" {
     var runner = Runner.init(std.testing.allocator);
     defer runner.deinit();
 
@@ -291,6 +420,38 @@ test "compile var" {
             .{ .local = 0 },
             .mul,
             .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 16 }, value);
+}
+
+test "run lambda" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .lambda = .{ .caps = 0, .len = 13 } },
+            .{ .local = 0 },
+            .{ .jmp_if = 2 },
+            .{ .pop = 0 },
+            .no_match,
+            .decons,
+            .{ .jmp_if = 1 },
+            .{ .jmp = 2 },
+            .{ .pop = 0 },
+            .no_match,
+            .{ .local = 0 },
+            .{ .local = 0 },
+            .mul,
+            .ret,
+            .{ .local = 0 },
+            .{ .num = 4 },
+            .nil,
+            .cons,
+            .tail_call,
         },
     });
     const value = try runner.runProgram(program);

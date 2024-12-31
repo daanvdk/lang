@@ -9,6 +9,11 @@ pub const Token = struct {
         null,
         ignore,
 
+        llist,
+        rlist,
+        comma,
+        lambda,
+
         lpar,
         rpar,
 

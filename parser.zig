@@ -217,7 +217,7 @@ const Parser = struct {
     }
 
     fn parsePow(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
-        const result = try self.parseLit(parse_type);
+        const result = try self.parseCall(parse_type);
         if (!parse_type.isExpr(result) or self.skip(&.{.pow}) == null) return result;
 
         const lhs = parse_type.toExpr(self.allocator, result);
@@ -231,17 +231,42 @@ const Parser = struct {
         return parse_type.fromExpr(.{ .pow = bin });
     }
 
+    fn parseCall(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const result = try self.parseLit(parse_type);
+        if (!parse_type.isExpr(result) or !self.peek(&.{.lpar})) return result;
+
+        var lhs = parse_type.toExpr(self.allocator, result);
+        errdefer lhs.deinit(self.allocator);
+
+        while (self.peek(&.{.lpar})) {
+            const rhs = try self.parseList(.expr, .lpar, .rpar);
+            errdefer rhs.deinit(self.allocator);
+
+            const bin = try self.allocator.create(Expr.Bin);
+            bin.* = .{ .lhs = lhs, .rhs = rhs };
+            lhs = .{ .call = bin };
+        }
+
+        return parse_type.fromExpr(lhs);
+    }
+
     fn parseLit(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
         if (self.peek(&.{.name})) {
             return try self.parseName(parse_type);
-        } else if (parse_type != .pattern and self.peek(&.{.num})) {
-            return parse_type.fromExpr(try self.parseNum());
-        } else if (parse_type != .pattern and self.peek(&.{.bool})) {
-            return parse_type.fromExpr(try self.parseBool());
-        } else if (parse_type != .pattern and self.peek(&.{.null})) {
-            return parse_type.fromExpr(try self.parseNull());
-        } else if (parse_type != .pattern and self.peek(&.{.lpar})) {
-            return parse_type.fromExpr(try self.parsePar());
+        } else if (self.peek(&.{.num})) {
+            return try parse_type.fromLit(self.allocator, try self.parseNum());
+        } else if (self.peek(&.{.bool})) {
+            return try parse_type.fromLit(self.allocator, try self.parseBool());
+        } else if (self.peek(&.{.null})) {
+            return try parse_type.fromLit(self.allocator, try self.parseNull());
+        } else if (parse_type != .expr and self.peek(&.{.ignore})) {
+            return parse_type.fromPattern(try self.parseIgnore());
+        } else if (self.peek(&.{.llist})) {
+            return try self.parseList(parse_type, .llist, .rlist);
+        } else if (parse_type != .pattern and self.peek(&.{.lambda})) {
+            return parse_type.fromExpr(try self.parseLambda());
+        } else if (self.peek(&.{.lpar})) {
+            return try parse_type.fromLit(self.allocator, try self.parsePar());
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -274,6 +299,64 @@ const Parser = struct {
     fn parseNull(self: *Parser) Error!Expr {
         _ = try self.expect(&.{.null});
         return .null;
+    }
+
+    fn parseIgnore(self: *Parser) Error!Pattern {
+        _ = try self.expect(&.{.ignore});
+        return .ignore;
+    }
+
+    fn parseList(self: *Parser, comptime parse_type: ParseType, start: Token.Type, end: Token.Type) Error!parse_type.Result() {
+        _ = try self.expect(&.{start});
+
+        const old_skip = self.skip_newlines;
+        defer self.skip_newlines = old_skip;
+        self.skip_newlines = true;
+
+        var state = ListState(parse_type).init(self.allocator);
+        defer state.deinit();
+
+        return try self.parseListTail(parse_type, &state, end);
+    }
+
+    fn parseListTail(self: *Parser, comptime parse_type: ParseType, state: *ListState(parse_type), end: Token.Type) Error!parse_type.Result() {
+        while (self.skip(&.{end}) == null) {
+            const item = try self.parseExpr(parse_type);
+            var owner = true;
+            errdefer if (owner) item.deinit(self.allocator);
+            if (!self.peek(&.{end})) _ = try self.expect(&.{.comma});
+
+            switch (parse_type) {
+                .expr, .pattern => try state.append(item),
+                .both => switch (item) {
+                    .expr => |expr| {
+                        var expr_state = try state.toExpr();
+                        defer expr_state.deinit();
+                        try expr_state.append(expr);
+                        owner = false;
+                        return parse_type.fromExpr(try self.parseListTail(.expr, &expr_state, end));
+                    },
+                    .pattern => |pattern| {
+                        var pattern_state = try state.toPattern();
+                        defer pattern_state.deinit();
+                        try pattern_state.append(pattern);
+                        owner = false;
+                        return parse_type.fromPattern(try self.parseListTail(.pattern, &pattern_state, end));
+                    },
+                    .both => |both| try state.append(both),
+                },
+            }
+        }
+        return try state.toResult();
+    }
+
+    fn parseLambda(self: *Parser) Error!Expr {
+        const matcher = try self.allocator.create(Expr.Matcher);
+        errdefer self.allocator.destroy(matcher);
+        matcher.pattern = try self.parseList(.pattern, .lambda, .lambda);
+        errdefer matcher.pattern.deinit(self.allocator);
+        matcher.expr = try self.parseExpr(.expr);
+        return .{ .lambda = matcher };
     }
 
     fn parsePar(self: *Parser) Error!Expr {
@@ -433,6 +516,28 @@ const ParseType = enum {
             .both => .{ .pattern = pattern },
         };
     }
+
+    inline fn fromLit(comptime self: ParseType, allocator: std.mem.Allocator, expr: Expr) !self.Result() {
+        switch (self) {
+            .expr => return expr,
+            .pattern => {
+                errdefer expr.deinit(allocator);
+                const expr_ptr = try allocator.create(Expr);
+                expr_ptr.* = expr;
+                return .{ .expr = expr_ptr };
+            },
+            .both => {
+                errdefer expr.deinit(allocator);
+                const expr_ptr = try allocator.create(Expr);
+                errdefer allocator.destroy(expr_ptr);
+                expr_ptr.* = try expr.clone(allocator);
+                return .{ .both = .{
+                    .expr = expr,
+                    .pattern = .{ .expr = expr_ptr },
+                } };
+            },
+        }
+    }
 };
 
 const ParseResult = union(ParseType) {
@@ -456,6 +561,88 @@ const Both = struct {
         self.pattern.deinit(allocator);
     }
 };
+
+fn ListState(comptime parse_type: ParseType) type {
+    return struct {
+        const Item = switch (parse_type) {
+            .expr => Expr,
+            .pattern => Pattern,
+            .both => Both,
+        };
+
+        items: std.ArrayList(Item),
+
+        const Self = @This();
+
+        fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .items = std.ArrayList(Item).init(allocator),
+            };
+        }
+
+        fn deinit(self: *Self) void {
+            self.items.deinit();
+        }
+
+        fn append(self: *Self, item: Item) !void {
+            try self.items.append(item);
+        }
+
+        fn toExpr(self: *Self) !ListState(.expr) {
+            if (parse_type != .both) unreachable;
+
+            var expr_state = ListState(.expr).init(self.items.allocator);
+            errdefer expr_state.deinit();
+
+            try expr_state.items.ensureUnusedCapacity(self.items.items.len);
+            for (self.items.items) |both| {
+                both.pattern.deinit(self.items.allocator);
+                expr_state.items.appendAssumeCapacity(both.expr);
+            }
+            self.items.clearAndFree();
+
+            return expr_state;
+        }
+
+        fn toPattern(self: *Self) !ListState(.pattern) {
+            if (parse_type != .both) unreachable;
+
+            var pattern_state = ListState(.pattern).init(self.items.allocator);
+            errdefer pattern_state.deinit();
+
+            try pattern_state.items.ensureUnusedCapacity(self.items.items.len);
+            for (self.items.items) |both| {
+                both.expr.deinit(self.items.allocator);
+                pattern_state.items.appendAssumeCapacity(both.pattern);
+            }
+            self.items.clearAndFree();
+
+            return pattern_state;
+        }
+
+        fn toResult(self: *Self) !parse_type.Result() {
+            switch (parse_type) {
+                .expr, .pattern => return .{ .list = try self.items.toOwnedSlice() },
+                .both => {
+                    const exprs = try self.items.allocator.alloc(Expr, self.items.items.len);
+                    errdefer self.items.allocator.free(exprs);
+                    const patterns = try self.items.allocator.alloc(Pattern, self.items.items.len);
+
+                    for (0.., self.items.items) |i, both| {
+                        exprs[i] = both.expr;
+                        patterns[i] = both.pattern;
+                    }
+                    self.items.clearAndFree();
+
+                    return .{ .both = .{
+                        .expr = .{ .list = exprs },
+                        .pattern = .{ .list = patterns },
+                    } };
+                },
+            }
+        }
+    };
+}
 
 test "parse num 1" {
     const expr = try parse(std.testing.allocator, "1337");
@@ -515,6 +702,34 @@ test "parse var" {
             .expr = .{ .mul = &.{
                 .lhs = .{ .name = "x" },
                 .rhs = .{ .name = "x" },
+            } },
+        }},
+    } }, expr);
+}
+
+test "parse lambda" {
+    const expr = try parse(std.testing.allocator, (
+        \\sqr = |x| x * x
+        \\sqr(4)
+    ));
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .match = &.{
+        .subject = .{ .lambda = &.{
+            .pattern = .{ .list = &.{
+                .{ .name = "x" },
+            } },
+            .expr = .{ .mul = &.{
+                .lhs = .{ .name = "x" },
+                .rhs = .{ .name = "x" },
+            } },
+        } },
+        .matchers = &.{.{
+            .pattern = .{ .name = "sqr" },
+            .expr = .{ .call = &.{
+                .lhs = .{ .name = "sqr" },
+                .rhs = .{ .list = &.{
+                    .{ .num = 4 },
+                } },
             } },
         }},
     } }, expr);

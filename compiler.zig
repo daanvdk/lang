@@ -54,13 +54,48 @@ const Compiler = struct {
                 }
                 return .any;
             },
-            inline .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge => |bin, tag| {
+            .list => |items| {
+                for (items) |item| {
+                    _ = try self.compileExpr(item, .used);
+                    try self.stack.push(null);
+                }
+
+                try self.instrs.append(.nil);
+
+                for (0..items.len) |_| {
+                    self.stack.pop();
+                    try self.instrs.append(.cons);
+                }
+
+                try self.compileUsage(usage);
+                return .list;
+            },
+            .lambda => |matcher| {
+                var compiler = Compiler.init(self.instrs.allocator);
+                defer compiler.deinit();
+
+                try compiler.compilePattern(matcher.pattern, .list, 0);
+                _ = try compiler.compileExpr(matcher.expr, .returned);
+
+                try self.instrs.append(.{ .lambda = .{
+                    .caps = 0,
+                    .len = @truncate(compiler.instrs.items.len),
+                } });
+                try self.instrs.appendSlice(compiler.instrs.items);
+                try self.compileUsage(usage);
+                return .any;
+            },
+            inline .call, .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge => |bin, tag| {
                 _ = try self.compileExpr(bin.lhs, .used);
                 try self.stack.push(null);
                 _ = try self.compileExpr(bin.rhs, .used);
                 self.stack.pop();
-                try self.instrs.append(@field(Instr, @tagName(tag)));
-                try self.compileUsage(usage);
+                if (tag == .call and usage == .returned) {
+                    try self.instrs.append(.tail_call);
+                } else {
+                    try self.instrs.append(@field(Instr, @tagName(tag)));
+                    try self.compileUsage(usage);
+                }
                 return .any;
             },
             inline .pos, .neg, .not => |expr_ptr, tag| {
@@ -237,6 +272,50 @@ const Compiler = struct {
             .ignore => {
                 try self.instrs.append(.{ .pop = self.stack.size() });
             },
+            .expr => |expr| {
+                try self.stack.push(null);
+                _ = try self.compileExpr(expr.*, .used);
+                self.stack.pop();
+                try self.instrs.append(.eq);
+                try self.compileNoMatch(true, start, 0);
+            },
+            .list => |items| {
+                if (!info.isList()) {
+                    try self.instrs.append(.{ .global = .is_list });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.compileNoMatch(true, start, 1);
+                }
+
+                for (items) |item| {
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.compileNoMatch(true, start, 1);
+                    try self.instrs.append(.decons);
+
+                    if (item == .name and self.stack.getFromIndex(start, item.name) == null) {
+                        try self.stack.push(.{ .name = item.name, .info = .any });
+                    } else if (item == .ignore) {
+                        try self.instrs.append(.{ .pop = self.stack.size() });
+                    } else {
+                        const curr = self.stack.size();
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .pop = curr });
+
+                        try self.stack.push(null);
+                        try self.compilePattern(item, .any, start);
+                        _ = self.stack.entries.orderedRemove(start);
+
+                        if (self.stack.size() != curr) {
+                            try self.instrs.append(.{ .local = curr });
+                            try self.instrs.append(.{ .pop = curr });
+                        }
+                    }
+                }
+
+                try self.compileNoMatch(false, start, 0);
+            },
         }
     }
 
@@ -263,12 +342,17 @@ const Compiler = struct {
 const Usage = enum { returned, used, ignored };
 const Info = enum {
     any,
+    list,
     all,
 
     fn merge(self: Info, other: Info) Info {
         if (self == other or self == .all) return other;
         if (other == .all) return self;
         return .any;
+    }
+
+    fn isList(self: Info) bool {
+        return self == .list or self == .all;
     }
 };
 
@@ -419,5 +503,51 @@ test "compile var" {
         .{ .local = 0 },
         .mul,
         .ret,
+    }, program.instrs);
+}
+
+test "compile lambda" {
+    const program = try compile(std.testing.allocator, .{ .match = &.{
+        .subject = .{ .lambda = &.{
+            .pattern = .{ .list = &.{
+                .{ .name = "x" },
+            } },
+            .expr = .{ .mul = &.{
+                .lhs = .{ .name = "x" },
+                .rhs = .{ .name = "x" },
+            } },
+        } },
+        .matchers = &.{.{
+            .pattern = .{ .name = "sqr" },
+            .expr = .{ .call = &.{
+                .lhs = .{ .name = "sqr" },
+                .rhs = .{ .list = &.{
+                    .{ .num = 4 },
+                } },
+            } },
+        }},
+    } });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .lambda = .{ .caps = 0, .len = 13 } },
+        .{ .local = 0 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 0 },
+        .no_match,
+        .decons,
+        .{ .jmp_if = 1 },
+        .{ .jmp = 2 },
+        .{ .pop = 0 },
+        .no_match,
+        .{ .local = 0 },
+        .{ .local = 0 },
+        .mul,
+        .ret,
+        .{ .local = 0 },
+        .{ .num = 4 },
+        .nil,
+        .cons,
+        .tail_call,
     }, program.instrs);
 }
