@@ -5,6 +5,10 @@ pub const Instr = union(enum) {
     num: f64,
     bool: bool,
     null,
+    str: packed struct {
+        index: u32,
+        len: u32,
+    },
 
     nil,
     cons,
@@ -42,5 +46,7 @@ pub const Instr = union(enum) {
 
     pub const Global = enum {
         is_list,
+        str,
+        print,
     };
 };

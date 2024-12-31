@@ -53,7 +53,7 @@ pub const Runner = struct {
     }
 
     fn runProgram(self: *Runner, program: Program) Error!Value {
-        const program_ = self.create(.program, .{ .instrs = program.instrs }) catch |err| {
+        const program_ = self.create(.program, .{ .instrs = program.instrs, .data = program.data }) catch |err| {
             program.deinit(self.allocator);
             return err;
         };
@@ -86,6 +86,11 @@ pub const Runner = struct {
                 },
                 inline .num, .bool, .null, .nil => |value, tag| {
                     try call.stack.append(self.allocator, @unionInit(Value, @tagName(tag), value));
+                },
+                .str => |str| {
+                    const content = call.program.data[str.index .. str.index + str.len];
+                    const value = try self.createValue(.str, .{ .content = content, .source = .{ .data = call.program } });
+                    try call.stack.append(self.allocator, value);
                 },
 
                 .cons => {
@@ -303,6 +308,44 @@ pub const Runner = struct {
                 else => false,
             } };
         }
+
+        fn str(self: *Runner, args: ?*Value.Cons) Error!Value {
+            var iter = Value.Cons.iter(args);
+            var buffer: std.ArrayListUnmanaged(u8) = .{};
+
+            while (iter.next()) |arg| {
+                if (arg.toStr()) |content| {
+                    try buffer.appendSlice(self.allocator, content);
+                } else {
+                    try buffer.writer(self.allocator).print("{}", .{arg});
+                }
+            }
+
+            const content = try buffer.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(content);
+            return self.createValue(.str, .{ .content = content, .source = .alloc });
+        }
+
+        fn print(_: *Runner, args: ?*Value.Cons) Error!Value {
+            var iter = Value.Cons.iter(args);
+            var first = true;
+
+            while (iter.next()) |arg| {
+                if (first) {
+                    first = false;
+                } else {
+                    std.debug.print(" ", .{});
+                }
+                if (arg.toStr()) |content| {
+                    std.debug.print("{s}", .{content});
+                } else {
+                    std.debug.print("{}", .{arg});
+                }
+            }
+            std.debug.print("\n", .{});
+
+            return .null;
+        }
     };
 };
 
@@ -321,6 +364,7 @@ test "run num 1" {
             .{ .num = 1337 },
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -336,6 +380,7 @@ test "run num 2" {
             .{ .num = 45.67 },
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -351,6 +396,7 @@ test "run bool 1" {
             .{ .bool = true },
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -366,6 +412,7 @@ test "run bool 2" {
             .{ .bool = false },
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -381,6 +428,7 @@ test "run null" {
             .null,
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -403,6 +451,7 @@ test "run operators" {
             .add,
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -421,6 +470,7 @@ test "run var" {
             .mul,
             .ret,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -453,6 +503,7 @@ test "run lambda" {
             .cons,
             .tail_call,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 
@@ -487,6 +538,7 @@ test "run closure" {
             .cons,
             .tail_call,
         },
+        .data = "",
     });
     const value = try runner.runProgram(program);
 

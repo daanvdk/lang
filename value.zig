@@ -38,6 +38,35 @@ pub const Value = union(enum) {
         };
     }
 
+    pub fn toStr(self: Value) ?[]const u8 {
+        return switch (self) {
+            .obj => |obj| switch (obj.type) {
+                .str => ObjType.str.detailed(obj).content,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    pub fn format(self: Value, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        switch (self) {
+            .num => |value| try writer.print("{d}", .{value}),
+            .bool => |value| {
+                if (value) {
+                    try writer.print("true", .{});
+                } else {
+                    try writer.print("false", .{});
+                }
+            },
+            .null => try writer.print("null", .{}),
+            .nil => try writer.print("[]", .{}),
+            .builtin => try writer.print("<builtin>", .{}),
+            .obj => |obj| switch (obj.type) {
+                inline else => |obj_type| try obj_type.detailed(obj).write(writer),
+            },
+        }
+    }
+
     pub const Obj = struct {
         type: ObjType,
         prev: ?*Obj,
@@ -51,12 +80,14 @@ pub const Value = union(enum) {
         program,
         cons,
         lambda,
+        str,
 
         pub fn Detail(comptime self: ObjType) type {
             return switch (self) {
                 .program => Program,
                 .cons => Cons,
                 .lambda => Lambda,
+                .str => Str,
             };
         }
 
@@ -68,6 +99,7 @@ pub const Value = union(enum) {
     pub const Program = struct {
         obj: Obj = undefined,
         instrs: []const Instr,
+        data: []const u8,
 
         pub inline fn eql(_: *Program, _: *Program) bool {
             return false;
@@ -79,6 +111,11 @@ pub const Value = union(enum) {
 
         pub fn deinit(self: Program, allocator: std.mem.Allocator) void {
             allocator.free(self.instrs);
+            allocator.free(self.data);
+        }
+
+        pub fn write(_: *Program, writer: anytype) !void {
+            try writer.print("<program>", .{});
         }
     };
 
@@ -87,7 +124,7 @@ pub const Value = union(enum) {
         head: Value,
         tail: ?*Cons,
 
-        pub inline fn eql(self: *Cons, other: *Cons) bool {
+        pub fn eql(self: *Cons, other: *Cons) bool {
             var self_ = self;
             var other_ = other;
             while (true) {
@@ -102,6 +139,16 @@ pub const Value = union(enum) {
         }
 
         pub fn deinit(_: Cons, _: std.mem.Allocator) void {}
+
+        pub fn write(self: *Cons, writer: anytype) !void {
+            try writer.print("[{}", .{self.head});
+            var tail = self.tail;
+            while (tail) |cons| {
+                try writer.print(", {}", .{cons.head});
+                tail = cons.tail;
+            }
+            try writer.print("]", .{});
+        }
 
         pub inline fn toValue(self: ?*Cons) Value {
             const cons = self orelse return .nil;
@@ -171,5 +218,54 @@ pub const Value = union(enum) {
         pub fn deinit(self: Lambda, allocator: std.mem.Allocator) void {
             allocator.free(self.stack);
         }
+
+        pub fn write(_: *Lambda, writer: anytype) !void {
+            try writer.print("<lambda>", .{});
+        }
+    };
+
+    pub const Str = struct {
+        obj: Obj = undefined,
+        content: []const u8,
+        source: Source,
+
+        pub inline fn eql(self: *Str, other: *Str) bool {
+            return std.mem.eql(u8, self.content, other.content);
+        }
+
+        pub inline fn truthy(self: *Str) bool {
+            return self.content.len > 0;
+        }
+
+        pub fn deinit(self: Str, allocator: std.mem.Allocator) void {
+            if (self.source == .alloc) allocator.free(self.content);
+        }
+
+        pub fn write(self: *Str, writer: anytype) !void {
+            try writer.print("\"", .{});
+            for (self.content) |char| {
+                switch (char) {
+                    '\"' => try writer.print("\\\"", .{}),
+                    '\\' => try writer.print("\\\\", .{}),
+                    '\n' => try writer.print("\\n", .{}),
+                    '\t' => try writer.print("\\t", .{}),
+                    '\r' => try writer.print("\\r", .{}),
+                    else => {
+                        if (std.ascii.isPrint(char)) {
+                            try writer.print("{c}", .{char});
+                        } else {
+                            try writer.print("\\x{X}", .{char});
+                        }
+                    },
+                }
+            }
+            try writer.print("\"", .{});
+        }
+
+        pub const Source = union(enum) {
+            data: *Program,
+            alloc,
+            slice: *Str,
+        };
     };
 };

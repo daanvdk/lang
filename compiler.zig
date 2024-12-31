@@ -6,16 +6,42 @@ const Instr = @import("instr.zig").Instr;
 const Program = @import("program.zig").Program;
 
 pub fn compile(allocator: std.mem.Allocator, expr: Expr) Compiler.Error!Program {
-    var compiler = Compiler.init(allocator);
+    var buffer = Buffer.init(allocator);
+    defer buffer.deinit();
+
+    var compiler = Compiler.init(&buffer);
     defer compiler.deinit();
 
     _ = try compiler.compileExpr(expr, .returned);
 
+    const data = try buffer.content.toOwnedSlice();
+    errdefer allocator.free(data);
     const instrs = try compiler.instrs.toOwnedSlice();
-    return .{ .instrs = instrs };
+    return .{ .instrs = instrs, .data = data };
 }
 
+const Buffer = struct {
+    content: std.ArrayList(u8),
+
+    fn init(allocator: std.mem.Allocator) Buffer {
+        return .{
+            .content = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *Buffer) void {
+        self.content.deinit();
+    }
+
+    fn add(self: *Buffer, content: []const u8) !usize {
+        const index = self.content.items.len;
+        try self.content.appendSlice(content);
+        return index;
+    }
+};
+
 const Compiler = struct {
+    buffer: *Buffer,
     instrs: std.ArrayList(Instr),
     stack: Stack,
     scope: std.StringHashMap(Info),
@@ -23,12 +49,13 @@ const Compiler = struct {
 
     const Error = std.mem.Allocator.Error || error{CompileError};
 
-    fn init(allocator: std.mem.Allocator) Compiler {
+    fn init(buffer: *Buffer) Compiler {
         return .{
-            .instrs = std.ArrayList(Instr).init(allocator),
-            .stack = Stack.init(allocator),
-            .scope = std.StringHashMap(Info).init(allocator),
-            .caps = std.ArrayList(Cap).init(allocator),
+            .buffer = buffer,
+            .instrs = std.ArrayList(Instr).init(buffer.content.allocator),
+            .stack = Stack.init(buffer.content.allocator),
+            .scope = std.StringHashMap(Info).init(buffer.content.allocator),
+            .caps = std.ArrayList(Cap).init(buffer.content.allocator),
         };
     }
 
@@ -41,6 +68,11 @@ const Compiler = struct {
 
     fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
         switch (expr) {
+            .global => |global| {
+                try self.instrs.append(.{ .global = global });
+                try self.compileUsage(usage);
+                return .any;
+            },
             .name => |name| {
                 var info: Info = undefined;
                 if (self.stack.get(name)) |local| {
@@ -73,6 +105,14 @@ const Compiler = struct {
                 }
                 return .any;
             },
+            .str => |content| {
+                const index = try self.buffer.add(content);
+                try self.instrs.append(.{ .str = .{
+                    .index = @truncate(index),
+                    .len = @truncate(content.len),
+                } });
+                return .any;
+            },
             .list => |items| {
                 for (items) |item| {
                     _ = try self.compileExpr(item, .used);
@@ -90,7 +130,7 @@ const Compiler = struct {
                 return .list;
             },
             .lambda => |matcher| {
-                var compiler = Compiler.init(self.instrs.allocator);
+                var compiler = Compiler.init(self.buffer);
                 defer compiler.deinit();
 
                 compiler.scope = try self.scope.clone();

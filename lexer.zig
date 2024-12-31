@@ -100,10 +100,13 @@ pub const Lexer = struct {
                 }
                 return .num;
             },
+            '"' => return .str,
 
             '[' => return .llist,
             ']' => return .rlist,
             ',' => return .comma,
+            '{' => return .ldict,
+            '}' => return .rdict,
             '|' => return .lambda,
 
             '(' => return .lpar,
@@ -196,9 +199,75 @@ pub const Lexer = struct {
         return pos;
     }
 
+    pub fn strChunk(self: *Lexer, allocator: std.mem.Allocator) !Chunk {
+        var content = std.ArrayList(u8).init(allocator);
+        defer content.deinit();
+
+        const expr = while (true) {
+            var char = try self.expectChar();
+            switch (char) {
+                '"' => break false,
+                '$' => {
+                    if (self.nextChar()) |next_char| {
+                        if (next_char == '{') break true;
+                        self.pushChar(next_char);
+                    }
+                },
+                '\\' => {
+                    char = try self.expectChar();
+                    switch (char) {
+                        'n' => char = '\n',
+                        't' => char = '\t',
+                        'r' => char = '\r',
+                        'x' => {
+                            const d1 = try self.expectHexChar();
+                            const d2 = try self.expectHexChar();
+                            char = (d1 << 4) | d2;
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+            try content.append(char);
+        };
+
+        return .{
+            .content = try content.toOwnedSlice(),
+            .expr = expr,
+        };
+    }
+
+    fn expectChar(self: *Lexer) !u8 {
+        if (self.nextChar()) |char| return char;
+        const pos = self.getIndexPos(self.index);
+        std.debug.print("{}:{}: unterminated str\n", .{ pos.line, pos.column });
+        return error.ParseError;
+    }
+
+    fn expectHexChar(self: *Lexer) !u8 {
+        const char = try self.expectChar();
+        switch (char) {
+            '0'...'9' => return char - '0',
+            'a'...'f' => return char - 'a' + 10,
+            'A'...'F' => return char - 'A' + 10,
+            else => {
+                self.pushChar(char);
+                const pos = self.getIndexPos(self.index);
+                std.debug.print("{}:{}: expected hex digit\n", .{ pos.line, pos.column });
+                return error.ParseError;
+            },
+        }
+    }
+
     pub const Pos = struct {
         line: usize,
         column: usize,
+    };
+
+    pub const Chunk = struct {
+        content: []const u8,
+        expr: bool,
     };
 
     const keywords = .{

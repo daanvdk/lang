@@ -259,6 +259,8 @@ const Parser = struct {
             return try parse_type.fromLit(self.allocator, try self.parseBool());
         } else if (self.peek(&.{.null})) {
             return try parse_type.fromLit(self.allocator, try self.parseNull());
+        } else if (self.peek(&.{.str})) {
+            return try parse_type.fromLit(self.allocator, try self.parseStr());
         } else if (parse_type != .expr and self.peek(&.{.ignore})) {
             return parse_type.fromPattern(try self.parseIgnore());
         } else if (self.peek(&.{.llist})) {
@@ -299,6 +301,50 @@ const Parser = struct {
     fn parseNull(self: *Parser) Error!Expr {
         _ = try self.expect(&.{.null});
         return .null;
+    }
+
+    fn parseStr(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.str});
+
+        var exprs = std.ArrayList(Expr).init(self.allocator);
+        defer {
+            for (exprs.items) |expr| expr.deinit(self.allocator);
+            exprs.deinit();
+        }
+
+        while (true) {
+            const chunk = try self.lexer.strChunk(self.allocator);
+
+            if (!chunk.expr and exprs.items.len == 0) {
+                return .{ .str = chunk.content };
+            }
+
+            if (chunk.content.len > 0) {
+                errdefer self.allocator.free(chunk.content);
+                try exprs.append(.{ .str = chunk.content });
+            } else {
+                self.allocator.free(chunk.content);
+            }
+
+            if (!chunk.expr) break;
+
+            const old_skip = self.skip_newlines;
+            defer self.skip_newlines = old_skip;
+            self.skip_newlines = true;
+
+            const expr = try self.parseExpr(.expr);
+            errdefer expr.deinit(self.allocator);
+            _ = try self.expect(&.{.rdict});
+            try exprs.append(expr);
+        }
+
+        const bin = try self.allocator.create(Expr.Bin);
+        errdefer self.allocator.destroy(bin);
+        bin.* = .{
+            .lhs = .{ .global = .str },
+            .rhs = .{ .list = try exprs.toOwnedSlice() },
+        };
+        return .{ .call = bin };
     }
 
     fn parseIgnore(self: *Parser) Error!Pattern {

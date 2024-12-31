@@ -7,11 +7,14 @@ pub const Token = struct {
         num,
         bool,
         null,
+        str,
         ignore,
 
         llist,
         rlist,
         comma,
+        ldict,
+        rdict,
         lambda,
 
         lpar,

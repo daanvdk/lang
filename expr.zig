@@ -1,12 +1,15 @@
 const std = @import("std");
 
 const Pattern = @import("pattern.zig").Pattern;
+const Instr = @import("instr.zig").Instr;
 
 pub const Expr = union(enum) {
+    global: Instr.Global,
     name: []const u8,
     num: f64,
     bool: bool,
     null,
+    str: []const u8,
 
     list: []const Expr,
     lambda: *const Matcher,
@@ -36,7 +39,8 @@ pub const Expr = union(enum) {
 
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
-            .name, .num, .bool, .null => {},
+            .global, .name, .num, .bool, .null => {},
+            .str => |content| allocator.free(content),
             .list => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
@@ -50,7 +54,8 @@ pub const Expr = union(enum) {
 
     pub fn clone(self: Expr, allocator: std.mem.Allocator) std.mem.Allocator.Error!Expr {
         switch (self) {
-            .name, .num, .bool, .null => return self,
+            .global, .name, .num, .bool, .null => return self,
+            .str => |content| return .{ .str = try allocator.dupe(u8, content) },
             .list => |items| {
                 const copies = try allocator.alloc(Expr, items.len);
                 var i: usize = 0;
