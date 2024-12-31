@@ -116,7 +116,13 @@ pub const Lexer = struct {
             '*' => return .mul,
             '/' => return .div,
             '+' => return .add,
-            '-' => return .sub,
+            '-' => {
+                if (self.nextChar()) |char1| {
+                    if (char1 == '>') return .pipe;
+                    self.pushChar(char1);
+                }
+                return .sub;
+            },
 
             '=' => {
                 if (self.nextChar()) |char1| {
@@ -277,5 +283,11 @@ pub const Lexer = struct {
         .not = .{"not"},
         .@"and" = .{"and"},
         .@"or" = .{"or"},
+        .do = .{"do"},
+        .end = .{"end"},
+        .match = .{"match"},
+        .@"if" = .{"if"},
+        .elif = .{"elif"},
+        .@"else" = .{"else"},
     };
 };

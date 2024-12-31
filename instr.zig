@@ -48,6 +48,14 @@ pub const Instr = union(enum) {
     pub const Global = enum {
         is_list,
         str,
+        join,
         print,
+
+        next,
+        send,
+        list,
+        map,
+        filter,
+        reduce,
     };
 };

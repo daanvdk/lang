@@ -21,16 +21,16 @@ pub fn compile(allocator: std.mem.Allocator, expr: Expr) Compiler.Error!Program 
     return .{ .instrs = instrs, .data = data };
 }
 
-const Buffer = struct {
+pub const Buffer = struct {
     content: std.ArrayList(u8),
 
-    fn init(allocator: std.mem.Allocator) Buffer {
+    pub fn init(allocator: std.mem.Allocator) Buffer {
         return .{
             .content = std.ArrayList(u8).init(allocator),
         };
     }
 
-    fn deinit(self: *Buffer) void {
+    pub fn deinit(self: *Buffer) void {
         self.content.deinit();
     }
 
@@ -41,7 +41,7 @@ const Buffer = struct {
     }
 };
 
-const Compiler = struct {
+pub const Compiler = struct {
     buffer: *Buffer,
     instrs: std.ArrayList(Instr),
     stack: Stack,
@@ -50,7 +50,7 @@ const Compiler = struct {
 
     const Error = std.mem.Allocator.Error || error{CompileError};
 
-    fn init(buffer: *Buffer) Compiler {
+    pub fn init(buffer: *Buffer) Compiler {
         return .{
             .buffer = buffer,
             .instrs = std.ArrayList(Instr).init(buffer.content.allocator),
@@ -60,14 +60,14 @@ const Compiler = struct {
         };
     }
 
-    fn deinit(self: *Compiler) void {
+    pub fn deinit(self: *Compiler) void {
         self.instrs.deinit();
         self.stack.deinit();
         self.scope.deinit();
         self.caps.deinit();
     }
 
-    fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
+    pub fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
         switch (expr) {
             .global => |global| {
                 try self.instrs.append(.{ .global = global });
@@ -119,15 +119,55 @@ const Compiler = struct {
                 try self.compileUsage(usage);
                 return .any;
             },
-            .list => |items| {
-                for (items) |item| {
-                    _ = try self.compileExpr(item, .used);
-                    try self.stack.push(null);
+            .list => return try self.compileExpr(.{ .lists = &.{expr} }, usage),
+            .lists => |cols| {
+                const start = self.stack.size();
+
+                var i: usize = 0;
+                while (i < cols.len and cols[i] == .list) : (i += 1) {
+                    for (cols[i].list) |item| {
+                        _ = try self.compileExpr(item, .used);
+                        try self.stack.push(null);
+                    }
                 }
 
-                try self.instrs.append(.nil);
+                switch (cols.len - i) {
+                    0 => try self.instrs.append(.nil),
+                    1 => {
+                        var index = self.instrs.items.len;
+                        const curr = self.stack.size();
+                        const info = try self.compileExpr(cols[i], .used);
 
-                for (0..items.len) |_| {
+                        if (!info.isList()) {
+                            while (index < self.instrs.items.len) {
+                                const instr = &self.instrs.items[index];
+                                index += 1;
+                                switch (instr.*) {
+                                    .local, .pop => |*j| {
+                                        if (j.* >= curr) j.* += 1;
+                                    },
+                                    .lambda => |lambda| {
+                                        index += lambda.len;
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            try self.insertInstr(index, .{ .global = .list });
+                            try self.instrs.append(.nil);
+                            try self.instrs.append(.cons);
+                            try self.instrs.append(.call);
+                        }
+                    },
+                    else => {
+                        _ = try self.compileExpr(.{ .call = &.{
+                            .lhs = .{ .global = .list },
+                            .rhs = .{ .list = cols[i..] },
+                        } }, .used);
+                    },
+                }
+
+                while (self.stack.size() > start) {
                     self.stack.pop();
                     try self.instrs.append(.cons);
                 }
@@ -159,9 +199,13 @@ const Compiler = struct {
                     res.value_ptr.* = caps.count() - 1;
                 }
 
-                for (compiler.instrs.items) |*instr| {
+                var i: usize = 0;
+                while (i < compiler.instrs.items.len) {
+                    const instr = &compiler.instrs.items[i];
+                    i += 1;
                     switch (instr.*) {
-                        .local, .pop => |*i| i.* += caps.count(),
+                        .local, .pop => |*j| j.* += caps.count(),
+                        .lambda => |lambda| i += lambda.len,
                         else => {},
                     }
                 }
@@ -340,6 +384,27 @@ const Compiler = struct {
 
                 return info;
             },
+            .@"if" => |if_| {
+                _ = try self.compileExpr(if_.cond, .used);
+                try self.instrs.append(.null);
+
+                const else_index = self.instrs.items.len;
+                const else_info = try self.compileExpr(if_.else_, usage);
+
+                var then_index = self.instrs.items.len;
+                const then_info = try self.compileExpr(if_.then, usage);
+
+                const then_len = self.instrs.items.len - then_index;
+                if (then_len > 0 and usage != .returned) {
+                    try self.insertInstr(then_index, .{ .jmp = then_len });
+                    then_index += 1;
+                }
+
+                const else_len = then_index - else_index;
+                self.instrs.items[else_index - 1] = .{ .jmp_if = else_len };
+
+                return then_info.merge(else_info);
+            },
         }
     }
 
@@ -372,7 +437,8 @@ const Compiler = struct {
                 try self.instrs.append(.eq);
                 try self.compileNoMatch(true, start, 0);
             },
-            .list => |items| {
+            .list => try self.compilePattern(.{ .lists = &.{pattern} }, info, start),
+            .lists => |cols| {
                 if (!info.isList()) {
                     try self.instrs.append(.{ .global = .is_list });
                     try self.instrs.append(.{ .local = self.stack.size() });
@@ -382,32 +448,39 @@ const Compiler = struct {
                     try self.compileNoMatch(true, start, 1);
                 }
 
-                for (items) |item| {
-                    try self.instrs.append(.{ .local = self.stack.size() });
-                    try self.compileNoMatch(true, start, 1);
-                    try self.instrs.append(.decons);
+                var i: usize = 0;
+                while (i < cols.len and cols[i] == .list) : (i += 1) {
+                    for (cols[i].list) |item| {
+                        try self.instrs.append(.{ .local = self.stack.size() });
+                        try self.compileNoMatch(true, start, 1);
+                        try self.instrs.append(.decons);
 
-                    if (item == .name and self.stack.getFromIndex(start, item.name) == null) {
-                        try self.stack.push(.{ .name = item.name, .info = .any });
-                    } else if (item == .ignore) {
-                        try self.instrs.append(.{ .pop = self.stack.size() });
-                    } else {
-                        const curr = self.stack.size();
-                        try self.instrs.append(.{ .local = curr });
-                        try self.instrs.append(.{ .pop = curr });
-
-                        try self.stack.push(null);
-                        try self.compilePattern(item, .any, start);
-                        _ = self.stack.entries.orderedRemove(start);
-
-                        if (self.stack.size() != curr) {
+                        if (item == .name and self.stack.getFromIndex(start, item.name) == null) {
+                            try self.stack.push(.{ .name = item.name, .info = .any });
+                        } else if (item == .ignore) {
+                            try self.instrs.append(.{ .pop = self.stack.size() });
+                        } else {
+                            const curr = self.stack.size();
                             try self.instrs.append(.{ .local = curr });
                             try self.instrs.append(.{ .pop = curr });
+
+                            try self.stack.push(null);
+                            try self.compilePattern(item, .any, start);
+                            _ = self.stack.entries.orderedRemove(start);
+
+                            if (self.stack.size() != curr) {
+                                try self.instrs.append(.{ .local = curr });
+                                try self.instrs.append(.{ .pop = curr });
+                            }
                         }
                     }
                 }
 
-                try self.compileNoMatch(false, start, 0);
+                switch (cols.len - i) {
+                    0 => try self.compileNoMatch(false, start, 0),
+                    1 => try self.compilePattern(cols[i], .list, start),
+                    else => unreachable,
+                }
             },
         }
     }
@@ -429,6 +502,17 @@ const Compiler = struct {
         }
 
         try self.instrs.append(.no_match);
+    }
+
+    fn insertInstr(self: *Compiler, index: usize, instr: Instr) !void {
+        try self.instrs.insert(index, instr);
+        var i = self.caps.items.len;
+        while (i > 0) {
+            i -= 1;
+            const cap = &self.caps.items[i];
+            if (cap.index < index) break;
+            cap.index += 1;
+        }
     }
 };
 

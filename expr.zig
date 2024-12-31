@@ -12,6 +12,7 @@ pub const Expr = union(enum) {
     str: []const u8,
 
     list: []const Expr,
+    lists: []const Expr,
     lambda: *const Matcher,
 
     call: *const Bin,
@@ -36,16 +37,17 @@ pub const Expr = union(enum) {
     @"or": *const Bin,
 
     match: *const Match,
+    @"if": *const If,
 
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
             .global, .name, .num, .bool, .null => {},
             .str => |content| allocator.free(content),
-            .list => |items| {
+            .list, .lists => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match => |value| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if" => |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
             },
@@ -56,7 +58,7 @@ pub const Expr = union(enum) {
         switch (self) {
             .global, .name, .num, .bool, .null => return self,
             .str => |content| return .{ .str = try allocator.dupe(u8, content) },
-            .list => |items| {
+            inline .list, .lists => |items, tag| {
                 const copies = try allocator.alloc(Expr, items.len);
                 var i: usize = 0;
                 errdefer {
@@ -66,9 +68,9 @@ pub const Expr = union(enum) {
                 while (i < items.len) : (i += 1) {
                     copies[i] = try items[i].clone(allocator);
                 }
-                return .{ .list = copies };
+                return @unionInit(Expr, @tagName(tag), copies);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match => |value, tag| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if" => |value, tag| {
                 const copy = try allocator.create(@TypeOf(value.*));
                 errdefer allocator.destroy(copy);
                 copy.* = try value.clone(allocator);
@@ -137,6 +139,28 @@ pub const Expr = union(enum) {
             copy.pattern = try self.pattern.clone(allocator);
             errdefer copy.pattern.deinit(allocator);
             copy.expr = try self.expr.clone(allocator);
+            return copy;
+        }
+    };
+
+    pub const If = struct {
+        cond: Expr,
+        then: Expr,
+        else_: Expr,
+
+        pub fn deinit(self: If, allocator: std.mem.Allocator) void {
+            self.cond.deinit(allocator);
+            self.then.deinit(allocator);
+            self.else_.deinit(allocator);
+        }
+
+        pub fn clone(self: If, allocator: std.mem.Allocator) std.mem.Allocator.Error!If {
+            var copy: If = undefined;
+            copy.cond = try self.cond.clone(allocator);
+            errdefer copy.cond.deinit(allocator);
+            copy.then = try self.then.clone(allocator);
+            errdefer copy.then.deinit(allocator);
+            copy.else_ = try self.else_.clone(allocator);
             return copy;
         }
     };

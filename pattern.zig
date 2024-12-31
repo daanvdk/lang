@@ -8,6 +8,7 @@ pub const Pattern = union(enum) {
     expr: *const Expr,
 
     list: []const Pattern,
+    lists: []const Pattern,
 
     pub fn deinit(self: Pattern, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -16,7 +17,7 @@ pub const Pattern = union(enum) {
                 expr.deinit(allocator);
                 allocator.destroy(expr);
             },
-            .list => |items| {
+            .list, .lists => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
@@ -32,7 +33,7 @@ pub const Pattern = union(enum) {
                 copy.* = try expr.clone(allocator);
                 return .{ .expr = copy };
             },
-            .list => |items| {
+            inline .list, .lists => |items, tag| {
                 const copies = try allocator.alloc(Pattern, items.len);
                 var i: usize = 0;
                 errdefer {
@@ -42,7 +43,7 @@ pub const Pattern = union(enum) {
                 while (i < items.len) : (i += 1) {
                     copies[i] = try items[i].clone(allocator);
                 }
-                return .{ .list = copies };
+                return @unionInit(Pattern, @tagName(tag), copies);
             },
         }
     }

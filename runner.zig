@@ -3,22 +3,179 @@ const std = @import("std");
 const Program = @import("program.zig").Program;
 const Instr = @import("instr.zig").Instr;
 const Value = @import("value.zig").Value;
+const parse = @import("parser.zig").parse;
+const Buffer = @import("compiler.zig").Buffer;
+const Compiler = @import("compiler.zig").Compiler;
 
 pub fn run(allocator: std.mem.Allocator, program: Program) Runner.Error!void {
-    var runner = Runner.init(allocator);
+    var runner = try Runner.init(allocator);
     defer runner.deinit();
     _ = try runner.runProgram(program);
 }
+
+const stdlib = .{
+    .send = (
+        \\|iter, value| match iter do
+        \\  [*list] = match list do
+        \\    [head, *tail] = [head, tail]
+        \\    _             = [null, null]
+        \\  end
+        \\  _ = iter(value)
+        \\end
+    ),
+    .next = (
+        \\|iter| do
+        \\  [head, tail] = send(iter, null)
+        \\  if tail == null do
+        \\    null
+        \\  else
+        \\    [head, tail]
+        \\  end
+        \\end
+    ),
+    .list = (
+        \\|*iters| match iters do
+        \\  [[*list]] = list
+        \\  [iter, *iters] = match next(iter) do
+        \\    [head, tail] = do
+        \\      [*tail] = list(tail, *iters)
+        \\      [head, *tail]
+        \\    end
+        \\    _ = list(*iters)
+        \\  end
+        \\  _ = []
+        \\end
+    ),
+    .map = (
+        \\|iter, f| |value| do
+        \\  [head, tail] = send(iter, value)
+        \\  if tail == null do
+        \\    [head, null]
+        \\  else
+        \\    [f(head), map(tail, f)]
+        \\  end
+        \\end
+    ),
+    .filter = (
+        \\|iter, f| |value| do
+        \\  [head, tail] = send(iter, value)
+        \\  if tail == null do
+        \\    [head, null]
+        \\  elif f(head) do
+        \\    [head, filter(tail, f)]
+        \\  else
+        \\    filter(tail, f)(null)
+        \\  end
+        \\end
+    ),
+    .reduce = (
+        \\|iter, f, acc| match next(iter) do
+        \\  [head, tail] = reduce(tail, f, f(acc, head))
+        \\  _ = acc
+        \\end
+    ),
+};
+
+const Stdlib = @TypeOf(stdlib);
+
+const StdlibOffsets = offsets: {
+    const stdfields = @typeInfo(Stdlib).Struct.fields;
+    var fields: [stdfields.len]std.builtin.Type.StructField = undefined;
+
+    for (0.., stdfields) |i, field| fields[i] = .{
+        .name = field.name,
+        .type = usize,
+        .default_value = null,
+        .is_comptime = false,
+        .alignment = 0,
+    };
+
+    break :offsets @Type(.{ .Struct = .{
+        .fields = &fields,
+        .decls = &.{},
+        .layout = .auto,
+        .is_tuple = false,
+    } });
+};
+
+const StdlibValues = values: {
+    const stdfields = @typeInfo(Stdlib).Struct.fields;
+    var fields: [stdfields.len]std.builtin.Type.StructField = undefined;
+
+    for (0.., stdfields) |i, field| fields[i] = .{
+        .name = field.name,
+        .type = Value,
+        .default_value = null,
+        .is_comptime = false,
+        .alignment = 0,
+    };
+
+    break :values @Type(.{ .Struct = .{
+        .fields = &fields,
+        .decls = &.{},
+        .layout = .auto,
+        .is_tuple = false,
+    } });
+};
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(*Call) = .{},
     last: ?*Value.Obj = null,
+    stdlib_values: StdlibValues,
 
     pub const Error = std.mem.Allocator.Error || error{RunError};
 
-    fn init(allocator: std.mem.Allocator) Runner {
-        return .{ .allocator = allocator };
+    fn init(allocator: std.mem.Allocator) Runner.Error!Runner {
+        var offsets: StdlibOffsets = undefined;
+        const base_program = program: {
+            var buffer = Buffer.init(allocator);
+            defer buffer.deinit();
+
+            var compiler = Compiler.init(&buffer);
+            defer compiler.deinit();
+
+            inline for (@typeInfo(Stdlib).Struct.fields) |field| {
+                @field(offsets, field.name) = compiler.instrs.items.len;
+                const content = @field(stdlib, field.name);
+                const expr = parse(allocator, content) catch |err| switch (err) {
+                    error.ParseError => unreachable,
+                    inline else => |err_| return err_,
+                };
+                defer expr.deinit(allocator);
+                _ = compiler.compileExpr(expr, .returned) catch |err| switch (err) {
+                    error.CompileError => unreachable,
+                    inline else => |err_| return err_,
+                };
+            }
+
+            const data = try buffer.content.toOwnedSlice();
+            errdefer allocator.free(data);
+            const instrs = try compiler.instrs.toOwnedSlice();
+            break :program Program{ .instrs = instrs, .data = data };
+        };
+
+        var self = Runner{
+            .allocator = allocator,
+            .stdlib_values = undefined,
+        };
+        errdefer self.deinit();
+
+        const program = self.create(.program, .{ .instrs = base_program.instrs, .data = base_program.data }) catch |err| {
+            base_program.deinit(allocator);
+            return err;
+        };
+
+        inline for (@typeInfo(Stdlib).Struct.fields) |field| {
+            var call = Call{
+                .program = program,
+                .offset = @field(offsets, field.name),
+            };
+            defer call.stack.deinit(allocator);
+            @field(self.stdlib_values, field.name) = try self.run(&call);
+        }
+
+        return self;
     }
 
     fn deinit(self: *Runner) void {
@@ -52,6 +209,20 @@ pub const Runner = struct {
         return detail.obj.toValue();
     }
 
+    fn createList(self: *Runner, items: []const Value) !?*Value.Cons {
+        var tail: ?*Value.Cons = null;
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            tail = try self.create(.cons, .{ .head = items[i], .tail = tail });
+        }
+        return tail;
+    }
+
+    fn createListValue(self: *Runner, items: []const Value) !Value {
+        return Value.Cons.toValue(try self.createList(items));
+    }
+
     fn runProgram(self: *Runner, program: Program) Error!Value {
         const program_ = self.create(.program, .{ .instrs = program.instrs, .data = program.data }) catch |err| {
             program.deinit(self.allocator);
@@ -72,9 +243,17 @@ pub const Runner = struct {
             ip += 1;
             switch (instr) {
                 .global => |global| {
-                    const value = switch (global) {
-                        inline else => |tag| Value{ .builtin = @field(Builtins, @tagName(tag)) },
-                    };
+                    var value: Value = undefined;
+                    switch (global) {
+                        inline else => |tag| {
+                            const field = @tagName(tag);
+                            if (@hasField(Stdlib, field)) {
+                                value = @field(self.stdlib_values, field);
+                            } else {
+                                value = .{ .builtin = @field(Builtins, field) };
+                            }
+                        },
+                    }
                     try call.stack.append(self.allocator, value);
                 },
                 .local => |local| {
@@ -269,6 +448,16 @@ pub const Runner = struct {
         };
     }
 
+    fn expectLambda(value: Value) !*Value.Lambda {
+        return switch (value) {
+            .obj => |obj| switch (obj.type) {
+                .lambda => @fieldParentPtr("obj", obj),
+                else => error.RunError,
+            },
+            else => error.RunError,
+        };
+    }
+
     fn expectList(value: Value) !?*Value.Cons {
         return switch (value) {
             .nil => null,
@@ -315,6 +504,7 @@ pub const Runner = struct {
         fn str(self: *Runner, args: ?*Value.Cons) Error!Value {
             var iter = Value.Cons.iter(args);
             var buffer: std.ArrayListUnmanaged(u8) = .{};
+            defer buffer.deinit(self.allocator);
 
             while (iter.next()) |arg| {
                 if (arg.toStr()) |content| {
@@ -322,6 +512,48 @@ pub const Runner = struct {
                 } else {
                     try buffer.writer(self.allocator).print("{}", .{arg});
                 }
+            }
+
+            if (Value.toShort(buffer.items)) |short| {
+                return .{ .str = short };
+            } else {
+                const content = try buffer.toOwnedSlice(self.allocator);
+                errdefer self.allocator.free(content);
+                return self.createValue(.str, .{ .content = content, .source = .alloc });
+            }
+        }
+
+        fn join(self: *Runner, args: ?*Value.Cons) Error!Value {
+            var arg_iter = Value.Cons.iter(args);
+            var iter = try arg_iter.expectNext();
+            const joiner = arg_iter.next() orelse Value{ .str = Value.toShort("").? };
+            try arg_iter.expectEnd();
+
+            var joiner_buffer: std.ArrayListUnmanaged(u8) = .{};
+            defer joiner_buffer.deinit(self.allocator);
+            if (joiner.toStr()) |content| {
+                try joiner_buffer.appendSlice(self.allocator, content);
+            } else {
+                try joiner_buffer.writer(self.allocator).print("{}", .{joiner});
+            }
+            joiner_buffer.shrinkAndFree(self.allocator, joiner_buffer.items.len);
+
+            var buffer: std.ArrayListUnmanaged(u8) = .{};
+            defer buffer.deinit(self.allocator);
+
+            var first = true;
+            while (try self.next(iter)) |pair| {
+                if (first) {
+                    first = false;
+                } else {
+                    try buffer.appendSlice(self.allocator, joiner_buffer.items);
+                }
+                if (pair[0].toStr()) |content| {
+                    try buffer.appendSlice(self.allocator, content);
+                } else {
+                    try buffer.writer(self.allocator).print("{}", .{pair[0]});
+                }
+                iter = pair[1];
             }
 
             if (Value.toShort(buffer.items)) |short| {
@@ -354,6 +586,27 @@ pub const Runner = struct {
             return .null;
         }
     };
+
+    fn next(self: *Runner, iter: Value) Error!?[2]Value {
+        const result = try self.runGlobal("next", &.{iter});
+        if (result == .null) return null;
+        return try Value.Cons.expectN(try expectList(result), 2);
+    }
+
+    fn runGlobal(self: *Runner, comptime field: []const u8, args: []const Value) Error!Value {
+        const lambda = try expectLambda(@field(self.stdlib_values, field));
+        var call = Call{
+            .program = lambda.program,
+            .offset = lambda.offset,
+        };
+        defer call.stack.deinit(self.allocator);
+
+        try call.stack.ensureUnusedCapacity(self.allocator, lambda.stack.len + 1);
+        call.stack.appendSliceAssumeCapacity(lambda.stack);
+        call.stack.appendAssumeCapacity(try self.createListValue(args));
+
+        return try self.run(&call);
+    }
 };
 
 fn cloneProgram(program: Program) !Program {

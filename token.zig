@@ -19,6 +19,7 @@ pub const Token = struct {
 
         lpar,
         rpar,
+        pipe,
 
         pow,
         mul,
@@ -38,6 +39,13 @@ pub const Token = struct {
         @"or",
 
         assign,
+
+        do,
+        end,
+        match,
+        @"if",
+        elif,
+        @"else",
 
         space,
         newline,
