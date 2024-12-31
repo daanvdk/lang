@@ -7,6 +7,26 @@ pub const Token = struct {
         bool,
         null,
 
+        lpar,
+        rpar,
+
+        pow,
+        mul,
+        div,
+        add,
+        sub,
+
+        eq,
+        ne,
+        lt,
+        le,
+        gt,
+        ge,
+
+        not,
+        @"and",
+        @"or",
+
         space,
         newline,
 

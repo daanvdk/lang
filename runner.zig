@@ -66,14 +66,105 @@ const Runner = struct {
             const instr = ip[0];
             ip += 1;
             switch (instr) {
+                .local => |local| {
+                    const value = call.stack.items[local];
+                    try call.stack.append(self.allocator, value);
+                },
+                .pop => |local| {
+                    _ = call.stack.orderedRemove(local);
+                },
                 inline .num, .bool, .null => |value, tag| {
                     try call.stack.append(self.allocator, @unionInit(Value, @tagName(tag), value));
                 },
+
+                .pow => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = std.math.pow(f64, lhs, rhs) });
+                },
+                .pos => {
+                    const value = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = value });
+                },
+                .neg => {
+                    const value = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = -value });
+                },
+                .mul => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = lhs * rhs });
+                },
+                .div => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = lhs / rhs });
+                },
+                .add => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = lhs + rhs });
+                },
+                .sub => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .num = lhs - rhs });
+                },
+
+                .eq => {
+                    const rhs = call.stack.pop();
+                    const lhs = call.stack.pop();
+                    try call.stack.append(self.allocator, .{ .bool = lhs.eql(rhs) });
+                },
+                .ne => {
+                    const rhs = call.stack.pop();
+                    const lhs = call.stack.pop();
+                    try call.stack.append(self.allocator, .{ .bool = !lhs.eql(rhs) });
+                },
+                .lt => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .bool = lhs < rhs });
+                },
+                .le => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .bool = lhs <= rhs });
+                },
+                .gt => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .bool = lhs > rhs });
+                },
+                .ge => {
+                    const rhs = try expectNum(call.stack.pop());
+                    const lhs = try expectNum(call.stack.pop());
+                    try call.stack.append(self.allocator, .{ .bool = lhs >= rhs });
+                },
+
+                .not => {
+                    const value = call.stack.pop();
+                    try call.stack.append(self.allocator, .{ .bool = !value.truthy() });
+                },
+                .jmp => |jmp| {
+                    ip += jmp;
+                },
+                .jmp_if => |jmp| {
+                    if (call.stack.pop().truthy()) ip += jmp;
+                },
+
                 .ret => {
                     return call.stack.pop();
                 },
             }
         }
+    }
+
+    fn expectNum(value: Value) !f64 {
+        return switch (value) {
+            .num => |num| num,
+            else => error.RunError,
+        };
     }
 
     const Call = struct {
@@ -162,4 +253,26 @@ test "run null" {
     const value = try runner.runProgram(program);
 
     try std.testing.expectEqualDeep(Value.null, value);
+}
+
+test "run operators" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .num = 1 },
+            .{ .num = 2 },
+            .mul,
+            .{ .num = 3 },
+            .{ .num = 4 },
+            .neg,
+            .div,
+            .add,
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 1.25 }, value);
 }

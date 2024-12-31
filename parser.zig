@@ -45,7 +45,130 @@ const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) Error!Expr {
-        return self.parseLit();
+        return self.parseOr();
+    }
+
+    fn parseOr(self: *Parser) Error!Expr {
+        const lhs = try self.parseAnd();
+        if (self.skip(&.{.@"or"}) == null) return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        const rhs = try self.parseOr();
+        errdefer rhs.deinit(self.allocator);
+
+        const bin = try self.allocator.create(Expr.Bin);
+        bin.* = .{ .lhs = lhs, .rhs = rhs };
+        return .{ .@"or" = bin };
+    }
+
+    fn parseAnd(self: *Parser) Error!Expr {
+        const lhs = try self.parseNot();
+        if (self.skip(&.{.@"and"}) == null) return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        const rhs = try self.parseAnd();
+        errdefer rhs.deinit(self.allocator);
+
+        const bin = try self.allocator.create(Expr.Bin);
+        bin.* = .{ .lhs = lhs, .rhs = rhs };
+        return .{ .@"and" = bin };
+    }
+
+    fn parseNot(self: *Parser) Error!Expr {
+        if (self.skip(&.{.not}) == null) return try self.parseCmp();
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseNot();
+        return .{ .not = expr };
+    }
+
+    fn parseCmp(self: *Parser) Error!Expr {
+        const lhs = try self.parseAdd();
+        const op = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge }) orelse return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        const rhs = try self.parseAdd();
+        errdefer rhs.deinit(self.allocator);
+
+        const bin = try self.allocator.create(Expr.Bin);
+        bin.* = .{ .lhs = lhs, .rhs = rhs };
+        return switch (op.type) {
+            inline .eq, .ne, .lt, .le, .gt, .ge => |tag| @unionInit(Expr, @tagName(tag), bin),
+            else => unreachable,
+        };
+    }
+
+    fn parseAdd(self: *Parser) Error!Expr {
+        var lhs = try self.parseMul();
+        if (!self.peek(&.{ .add, .sub })) return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        while (self.skip(&.{ .add, .sub })) |op| {
+            const rhs = try self.parseMul();
+            errdefer rhs.deinit(self.allocator);
+
+            const bin = try self.allocator.create(Expr.Bin);
+            bin.* = .{ .lhs = lhs, .rhs = rhs };
+            lhs = switch (op.type) {
+                inline .add, .sub => |tag| @unionInit(Expr, @tagName(tag), bin),
+                else => unreachable,
+            };
+        }
+
+        return lhs;
+    }
+
+    fn parseMul(self: *Parser) Error!Expr {
+        var lhs = try self.parseNeg();
+        if (!self.peek(&.{ .mul, .div })) return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        while (self.skip(&.{ .mul, .div })) |op| {
+            const rhs = try self.parseNeg();
+            errdefer rhs.deinit(self.allocator);
+
+            const bin = try self.allocator.create(Expr.Bin);
+            bin.* = .{ .lhs = lhs, .rhs = rhs };
+            lhs = switch (op.type) {
+                inline .mul, .div => |tag| @unionInit(Expr, @tagName(tag), bin),
+                else => unreachable,
+            };
+        }
+
+        return lhs;
+    }
+
+    fn parseNeg(self: *Parser) Error!Expr {
+        const op = self.skip(&.{ .add, .sub }) orelse return try self.parsePow();
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseNeg();
+        return switch (op.type) {
+            .add => .{ .pos = expr },
+            .sub => .{ .neg = expr },
+            else => unreachable,
+        };
+    }
+
+    fn parsePow(self: *Parser) Error!Expr {
+        const lhs = try self.parseLit();
+        if (self.skip(&.{.pow}) == null) return lhs;
+
+        errdefer lhs.deinit(self.allocator);
+
+        const rhs = try self.parseNeg();
+        errdefer rhs.deinit(self.allocator);
+
+        const bin = try self.allocator.create(Expr.Bin);
+        bin.* = .{ .lhs = lhs, .rhs = rhs };
+        return .{ .pow = bin };
     }
 
     fn parseLit(self: *Parser) Error!Expr {
@@ -55,6 +178,8 @@ const Parser = struct {
             return try self.parseBool();
         } else if (self.peek(&.{.null})) {
             return try self.parseNull();
+        } else if (self.peek(&.{.lpar})) {
+            return try self.parsePar();
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -76,6 +201,21 @@ const Parser = struct {
     fn parseNull(self: *Parser) Error!Expr {
         _ = try self.expect(&.{.null});
         return .null;
+    }
+
+    fn parsePar(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.lpar});
+
+        const old_skip = self.skip_newlines;
+        defer self.skip_newlines = old_skip;
+        self.skip_newlines = true;
+
+        const expr = try self.parseExpr();
+        defer expr.deinit(self.allocator);
+
+        _ = try self.expect(&.{.rpar});
+
+        return expr;
     }
 
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
@@ -174,4 +314,19 @@ test "parse null" {
     const expr = try parse(std.testing.allocator, "null");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr.null, expr);
+}
+
+test "parse operators" {
+    const expr = try parse(std.testing.allocator, "1 * 2 + 3 / -4");
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .add = &.{
+        .lhs = .{ .mul = &.{
+            .lhs = .{ .num = 1 },
+            .rhs = .{ .num = 2 },
+        } },
+        .rhs = .{ .div = &.{
+            .lhs = .{ .num = 3 },
+            .rhs = .{ .neg = &.{ .num = 4 } },
+        } },
+    } }, expr);
 }

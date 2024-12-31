@@ -102,6 +102,46 @@ pub const Lexer = struct {
                 return .num;
             },
 
+            '(' => return .lpar,
+            ')' => return .rpar,
+
+            '^' => return .pow,
+            '*' => return .mul,
+            '/' => return .div,
+            '+' => return .add,
+            '-' => return .sub,
+
+            '=' => {
+                if (self.nextChar()) |char1| {
+                    if (char1 == '=') return .eq;
+                    self.pushChar(char1);
+                }
+                self.pushChar(char0);
+                return null;
+            },
+            '!' => {
+                if (self.nextChar()) |char1| {
+                    if (char1 == '=') return .ne;
+                    self.pushChar(char1);
+                }
+                self.pushChar(char0);
+                return null;
+            },
+            '<' => {
+                if (self.nextChar()) |char1| {
+                    if (char1 == '=') return .lt;
+                    self.pushChar(char1);
+                }
+                return .le;
+            },
+            '>' => {
+                if (self.nextChar()) |char1| {
+                    if (char1 == '=') return .gt;
+                    self.pushChar(char1);
+                }
+                return .ge;
+            },
+
             '\n' => return .newline,
             ' ', '\t', '\r' => {
                 while (self.nextChar()) |char1| {
@@ -161,5 +201,8 @@ pub const Lexer = struct {
     const keywords = .{
         .bool = .{ "true", "false" },
         .null = .{"null"},
+        .not = .{"not"},
+        .@"and" = .{"and"},
+        .@"or" = .{"or"},
     };
 };
