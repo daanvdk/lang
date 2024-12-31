@@ -40,9 +40,11 @@ pub const Instr = union(enum) {
     not,
 
     jmp: usize,
+    jmp_back: usize,
     jmp_if: usize,
 
     ret,
+    yield,
     no_match,
 
     pub const Global = enum {
@@ -57,5 +59,6 @@ pub const Instr = union(enum) {
         map,
         filter,
         reduce,
+        count,
     };
 };

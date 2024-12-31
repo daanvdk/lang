@@ -18,6 +18,7 @@ const Parser = struct {
     token: ?Token = null,
     expected: std.EnumSet(Token.Type) = undefined,
     skip_newlines: bool = false,
+    is_gen: bool = false,
 
     const Error = std.mem.Allocator.Error || error{ParseError};
 
@@ -300,6 +301,10 @@ const Parser = struct {
             return parse_type.fromExpr(try self.parseMatch());
         } else if (parse_type != .pattern and self.peek(&.{.@"if"})) {
             return parse_type.fromExpr(try self.parseIf());
+        } else if (parse_type != .pattern and self.peek(&.{.@"for"})) {
+            return parse_type.fromExpr(try self.parseFor());
+        } else if (parse_type != .pattern and self.is_gen and self.peek(&.{.yield})) {
+            return parse_type.fromExpr(try self.parseYield());
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -429,6 +434,10 @@ const Parser = struct {
     }
 
     fn parseLambda(self: *Parser) Error!Expr {
+        const old_is_gen = self.is_gen;
+        defer self.is_gen = old_is_gen;
+        self.is_gen = false;
+
         const matcher = try self.allocator.create(Expr.Matcher);
         errdefer self.allocator.destroy(matcher);
         matcher.pattern = try self.parseList(.pattern, .lambda, .lambda);
@@ -445,7 +454,7 @@ const Parser = struct {
         self.skip_newlines = true;
 
         const expr = try self.parseExpr(.expr);
-        defer expr.deinit(self.allocator);
+        errdefer expr.deinit(self.allocator);
 
         _ = try self.expect(&.{.rpar});
 
@@ -454,8 +463,19 @@ const Parser = struct {
 
     fn parseDo(self: *Parser) Error!Expr {
         _ = try self.expect(&.{.do});
+        const is_gen = self.skip(&.{.mul}) != null;
+
+        const old_is_gen = self.is_gen;
+        defer self.is_gen = old_is_gen;
+        if (is_gen) self.is_gen = true;
+
         const body = try self.parseBody(&.{.end});
-        return body.expr;
+        if (!is_gen) return body.expr;
+
+        errdefer body.expr.deinit(self.allocator);
+        const expr_ptr = try self.allocator.create(Expr);
+        expr_ptr.* = body.expr;
+        return .{ .gen = expr_ptr };
     }
 
     fn parseMatch(self: *Parser) Error!Expr {
@@ -519,6 +539,7 @@ const Parser = struct {
 
             _ = try self.expect(&.{.do});
             const body = try self.parseBody(&.{ .elif, .@"else", .end });
+            errdefer body.expr.deinit(self.allocator);
 
             try conds.append(.{ .lhs = cond, .rhs = body.expr });
 
@@ -549,11 +570,48 @@ const Parser = struct {
         return expr;
     }
 
+    fn parseFor(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.@"for"});
+
+        const old_skip = self.skip_newlines;
+        defer self.skip_newlines = old_skip;
+        self.skip_newlines = true;
+
+        const pattern = try self.parseExpr(.pattern);
+        errdefer pattern.deinit(self.allocator);
+
+        _ = try self.expect(&.{.in});
+
+        const subject = try self.parseExpr(.expr);
+        errdefer subject.deinit(self.allocator);
+
+        _ = try self.expect(&.{.do});
+
+        const body = try self.parseBody(&.{.end});
+        errdefer body.expr.deinit(self.allocator);
+
+        const for_ = try self.allocator.create(Expr.For);
+        for_.* = .{ .pattern = pattern, .subject = subject, .expr = body.expr };
+        return .{ .@"for" = for_ };
+    }
+
+    fn parseYield(self: *Parser) Error!Expr {
+        std.debug.assert(self.is_gen);
+        _ = try self.expect(&.{.yield});
+        const is_all = self.skip(&.{.mul}) != null;
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseExpr(.expr);
+
+        return if (is_all) .{ .yield_all = expr } else .{ .yield = expr };
+    }
+
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
         const token = while (true) {
             if (self.token) |token| {
                 switch (token.type) {
-                    .space => {},
+                    .space, .comment => {},
                     .newline => if (!self.skip_newlines) break token,
                     else => break token,
                 }

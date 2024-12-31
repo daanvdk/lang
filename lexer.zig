@@ -141,17 +141,17 @@ pub const Lexer = struct {
             },
             '<' => {
                 if (self.nextChar()) |char1| {
-                    if (char1 == '=') return .lt;
+                    if (char1 == '=') return .le;
                     self.pushChar(char1);
                 }
-                return .le;
+                return .lt;
             },
             '>' => {
                 if (self.nextChar()) |char1| {
-                    if (char1 == '=') return .gt;
+                    if (char1 == '=') return .ge;
                     self.pushChar(char1);
                 }
-                return .ge;
+                return .gt;
             },
 
             '\n' => return .newline,
@@ -166,6 +166,18 @@ pub const Lexer = struct {
                     }
                 }
                 return .space;
+            },
+            '#' => {
+                while (self.nextChar()) |char1| {
+                    switch (char1) {
+                        '\n' => {
+                            self.pushChar(char1);
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+                return .comment;
             },
 
             else => {
@@ -289,5 +301,8 @@ pub const Lexer = struct {
         .@"if" = .{"if"},
         .elif = .{"elif"},
         .@"else" = .{"else"},
+        .@"for" = .{"for"},
+        .in = .{"in"},
+        .yield = .{"yield"},
     };
 };

@@ -47,6 +47,7 @@ pub const Compiler = struct {
     stack: Stack,
     scope: std.StringHashMap(Info),
     caps: std.ArrayList(Cap),
+    is_gen: bool = false,
 
     const Error = std.mem.Allocator.Error || error{CompileError};
 
@@ -139,16 +140,12 @@ pub const Compiler = struct {
                         const info = try self.compileExpr(cols[i], .used);
 
                         if (!info.isList()) {
-                            while (index < self.instrs.items.len) {
-                                const instr = &self.instrs.items[index];
-                                index += 1;
-                                switch (instr.*) {
+                            while (index < self.instrs.items.len) : (index += 1) {
+                                switch (self.instrs.items[index]) {
                                     .local, .pop => |*j| {
                                         if (j.* >= curr) j.* += 1;
                                     },
-                                    .lambda => |lambda| {
-                                        index += lambda.len;
-                                    },
+                                    .lambda => |lambda| index += lambda.len,
                                     else => {},
                                 }
                             }
@@ -175,7 +172,7 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .list;
             },
-            .lambda => |matcher| {
+            inline .lambda, .gen => |value, tag| {
                 var compiler = Compiler.init(self.buffer);
                 defer compiler.deinit();
 
@@ -185,8 +182,17 @@ pub const Compiler = struct {
                     try compiler.scope.put(entry.name, entry.info);
                 }
 
-                try compiler.compilePattern(matcher.pattern, .list, 0);
-                _ = try compiler.compileExpr(matcher.expr, .returned);
+                try compiler.compilePattern(switch (tag) {
+                    .lambda => value.pattern,
+                    .gen => .{ .list = &.{.{ .expr = &.null }} },
+                    else => unreachable,
+                }, .list, 0);
+                if (tag == .gen) compiler.is_gen = true;
+                _ = try compiler.compileExpr(switch (tag) {
+                    .lambda => value.expr,
+                    .gen => value.*,
+                    else => unreachable,
+                }, .returned);
 
                 var caps = std.StringHashMap(usize).init(self.instrs.allocator);
                 defer caps.deinit();
@@ -199,13 +205,11 @@ pub const Compiler = struct {
                     res.value_ptr.* = caps.count() - 1;
                 }
 
-                var i: usize = 0;
-                while (i < compiler.instrs.items.len) {
-                    const instr = &compiler.instrs.items[i];
-                    i += 1;
-                    switch (instr.*) {
-                        .local, .pop => |*j| j.* += caps.count(),
-                        .lambda => |lambda| i += lambda.len,
+                var index: usize = 0;
+                while (index < compiler.instrs.items.len) : (index += 1) {
+                    switch (compiler.instrs.items[index]) {
+                        .local, .pop => |*i| i.* += caps.count(),
+                        .lambda => |lambda| index += lambda.len,
                         else => {},
                     }
                 }
@@ -227,7 +231,7 @@ pub const Compiler = struct {
                 try self.stack.push(null);
                 _ = try self.compileExpr(bin.rhs, .used);
                 self.stack.pop();
-                if (tag == .call and usage == .returned) {
+                if (tag == .call and usage == .returned and !self.is_gen) {
                     try self.instrs.append(.tail_call);
                 } else {
                     try self.instrs.append(@field(Instr, @tagName(tag)));
@@ -405,12 +409,103 @@ pub const Compiler = struct {
 
                 return then_info.merge(else_info);
             },
+            .yield => |expr_ptr| {
+                std.debug.assert(self.is_gen);
+                _ = try self.compileExpr(expr_ptr.*, .used);
+                try self.instrs.append(.yield);
+
+                const start = self.stack.size();
+                try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .list, start);
+                self.stack.entries.shrinkRetainingCapacity(start);
+
+                try self.compileUsage(usage);
+                return .any;
+            },
+            inline .@"for", .yield_all => |value, tag| {
+                std.debug.assert(self.is_gen);
+
+                try self.instrs.append(.{ .global = .send });
+                try self.stack.push(null);
+                _ = try self.compileExpr(switch (tag) {
+                    .@"for" => value.subject,
+                    .yield_all => value.*,
+                    else => unreachable,
+                }, .used);
+                self.stack.pop();
+                try self.instrs.append(.null);
+
+                const loop_index = self.instrs.items.len;
+                try self.instrs.append(.nil);
+                try self.instrs.append(.cons);
+                try self.instrs.append(.cons);
+
+                if (tag == .yield_all and usage == .returned) {
+                    try self.instrs.append(.tail_call);
+                    return .any;
+                }
+
+                try self.instrs.append(.call);
+                const start = self.stack.size();
+                try self.compilePattern(.{ .list = &.{ .{ .name = "head" }, .{ .name = "tail" } } }, .any, start);
+                self.stack.entries.shrinkRetainingCapacity(start);
+                try self.instrs.append(.{ .local = start + 1 });
+                try self.instrs.append(.null);
+                try self.instrs.append(.eq);
+                try self.instrs.append(.null);
+
+                const body_index = self.instrs.items.len;
+                try self.instrs.append(.{ .global = .send });
+                try self.instrs.append(.{ .local = start + 1 });
+                try self.instrs.append(.{ .pop = start + 1 });
+                try self.instrs.append(.{ .local = start });
+                try self.instrs.append(.{ .pop = start });
+                try self.stack.push(null);
+                try self.stack.push(null);
+
+                switch (tag) {
+                    .@"for" => {
+                        try self.compilePattern(value.pattern, .any, start + 2);
+                        _ = try self.compileExpr(value.expr, .used);
+                        while (self.stack.size() > start + 2) {
+                            self.stack.pop();
+                            try self.instrs.append(.{ .pop = self.stack.size() });
+                        }
+                    },
+                    .yield_all => {
+                        try self.instrs.append(.yield);
+                        try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .any, start + 2);
+                        self.stack.entries.shrinkRetainingCapacity(start + 2);
+                    },
+                    else => unreachable,
+                }
+
+                self.stack.pop();
+                self.stack.pop();
+                try self.instrs.append(.null);
+
+                const end_index = self.instrs.items.len;
+                try self.instrs.append(.{ .pop = start + 1 });
+
+                self.instrs.items[body_index - 1] = .{ .jmp_if = end_index - body_index };
+                self.instrs.items[end_index - 1] = .{ .jmp_back = end_index - loop_index };
+
+                try self.compileUsage(usage);
+                return .any;
+            },
         }
     }
 
     fn compileUsage(self: *Compiler, usage: Usage) Error!void {
         switch (usage) {
-            .returned => try self.instrs.append(.ret),
+            .returned => {
+                if (self.is_gen) {
+                    try self.instrs.append(.null);
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.cons);
+                }
+                try self.instrs.append(.ret);
+            },
             .used => {},
             .ignored => try self.instrs.append(.{ .pop = self.stack.size() }),
         }

@@ -38,6 +38,10 @@ pub const Expr = union(enum) {
 
     match: *const Match,
     @"if": *const If,
+    @"for": *const For,
+    gen: *const Expr,
+    yield: *const Expr,
+    yield_all: *const Expr,
 
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -47,7 +51,7 @@ pub const Expr = union(enum) {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if" => |value| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all => |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
             },
@@ -70,7 +74,7 @@ pub const Expr = union(enum) {
                 }
                 return @unionInit(Expr, @tagName(tag), copies);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if" => |value, tag| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all => |value, tag| {
                 const copy = try allocator.create(@TypeOf(value.*));
                 errdefer allocator.destroy(copy);
                 copy.* = try value.clone(allocator);
@@ -161,6 +165,28 @@ pub const Expr = union(enum) {
             copy.then = try self.then.clone(allocator);
             errdefer copy.then.deinit(allocator);
             copy.else_ = try self.else_.clone(allocator);
+            return copy;
+        }
+    };
+
+    pub const For = struct {
+        pattern: Pattern,
+        subject: Expr,
+        expr: Expr,
+
+        pub fn deinit(self: For, allocator: std.mem.Allocator) void {
+            self.pattern.deinit(allocator);
+            self.subject.deinit(allocator);
+            self.expr.deinit(allocator);
+        }
+
+        pub fn clone(self: For, allocator: std.mem.Allocator) std.mem.Allocator.Error!For {
+            var copy: For = undefined;
+            copy.pattern = try self.pattern.clone(allocator);
+            errdefer copy.pattern.deinit(allocator);
+            copy.subject = try self.subject.clone(allocator);
+            errdefer copy.subject.deinit(allocator);
+            copy.expr = try self.expr.clone(allocator);
             return copy;
         }
     };

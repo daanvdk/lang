@@ -47,24 +47,16 @@ const stdlib = .{
         \\end
     ),
     .map = (
-        \\|iter, f| |value| do
-        \\  [head, tail] = send(iter, value)
-        \\  if tail == null do
-        \\    [head, null]
-        \\  else
-        \\    [f(head), map(tail, f)]
+        \\|iter, f| do*
+        \\  for item in iter do
+        \\    yield f(item)
         \\  end
         \\end
     ),
     .filter = (
-        \\|iter, f| |value| do
-        \\  [head, tail] = send(iter, value)
-        \\  if tail == null do
-        \\    [head, null]
-        \\  elif f(head) do
-        \\    [head, filter(tail, f)]
-        \\  else
-        \\    filter(tail, f)(null)
+        \\|iter, f| do*
+        \\  for item in iter do
+        \\    if f(item) do yield item end
         \\  end
         \\end
     ),
@@ -72,6 +64,18 @@ const stdlib = .{
         \\|iter, f, acc| match next(iter) do
         \\  [head, tail] = reduce(tail, f, f(acc, head))
         \\  _ = acc
+        \\end
+    ),
+    .count = (
+        \\|*args| match args do
+        \\  [start, stop, step] = do*
+        \\    if (if step >= 0 do start < stop else start > stop end) do
+        \\      yield start
+        \\      yield* count(start + step, stop, step)
+        \\    end
+        \\  end
+        \\  [start, stop] = count(start, stop, 1)
+        \\  [stop] = count(0, stop, 1)
         \\end
     ),
 };
@@ -240,6 +244,7 @@ pub const Runner = struct {
         var ip = call.program.instrs.ptr + call.offset;
         while (true) {
             const instr = ip[0];
+            // std.debug.print("{any}\n{}\n", .{ call.stack.items, instr });
             ip += 1;
             switch (instr) {
                 .global => |global| {
@@ -287,17 +292,17 @@ pub const Runner = struct {
                     try call.stack.append(self.allocator, Value.Cons.toValue(cons.tail));
                 },
                 .lambda => |lambda| {
-                    const stack_ = try self.allocator.alloc(Value, lambda.caps);
+                    const stack = try self.allocator.alloc(Value, lambda.caps);
                     const index = call.stack.items.len - lambda.caps;
-                    @memcpy(stack_, call.stack.items[index..]);
+                    @memcpy(stack, call.stack.items[index..]);
                     call.stack.shrinkRetainingCapacity(index);
 
                     const value = self.createValue(.lambda, .{
                         .program = call.program,
                         .offset = (@intFromPtr(ip) - @intFromPtr(call.program.instrs.ptr)) / @sizeOf(Instr),
-                        .stack = stack_,
+                        .stack = stack,
                     }) catch |err| {
-                        self.allocator.free(stack_);
+                        self.allocator.free(stack);
                         return err;
                     };
                     try call.stack.append(self.allocator, value);
@@ -417,12 +422,28 @@ pub const Runner = struct {
                 .jmp => |jmp| {
                     ip += jmp;
                 },
+                .jmp_back => |jmp| {
+                    ip -= jmp;
+                },
                 .jmp_if => |jmp| {
                     if (call.stack.pop().truthy()) ip += jmp;
                 },
 
                 .ret => {
                     return call.stack.pop();
+                },
+                .yield => {
+                    const head = call.stack.pop();
+                    const stack = try call.stack.toOwnedSlice(self.allocator);
+                    const tail = self.createValue(.lambda, .{
+                        .program = call.program,
+                        .offset = (@intFromPtr(ip) - @intFromPtr(call.program.instrs.ptr)) / @sizeOf(Instr),
+                        .stack = stack,
+                    }) catch |err| {
+                        self.allocator.free(stack);
+                        return err;
+                    };
+                    return try self.createListValue(&.{ head, tail });
                 },
                 .no_match => {
                     return error.RunError;

@@ -46,8 +46,12 @@ pub const Token = struct {
         @"if",
         elif,
         @"else",
+        @"for",
+        in,
+        yield,
 
         space,
+        comment,
         newline,
 
         unknown,
