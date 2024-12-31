@@ -87,7 +87,10 @@ pub const Runner = struct {
                 inline .num, .bool, .null, .nil => |value, tag| {
                     try call.stack.append(self.allocator, @unionInit(Value, @tagName(tag), value));
                 },
-                .str => |str| {
+                .short_str => |short| {
+                    try call.stack.append(self.allocator, .{ .str = short });
+                },
+                .long_str => |str| {
                     const content = call.program.data[str.index .. str.index + str.len];
                     const value = try self.createValue(.str, .{ .content = content, .source = .{ .data = call.program } });
                     try call.stack.append(self.allocator, value);
@@ -321,9 +324,13 @@ pub const Runner = struct {
                 }
             }
 
-            const content = try buffer.toOwnedSlice(self.allocator);
-            errdefer self.allocator.free(content);
-            return self.createValue(.str, .{ .content = content, .source = .alloc });
+            if (Value.toShort(buffer.items)) |short| {
+                return .{ .str = short };
+            } else {
+                const content = try buffer.toOwnedSlice(self.allocator);
+                errdefer self.allocator.free(content);
+                return self.createValue(.str, .{ .content = content, .source = .alloc });
+            }
         }
 
         fn print(_: *Runner, args: ?*Value.Cons) Error!Value {

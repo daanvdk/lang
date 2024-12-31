@@ -5,7 +5,8 @@ pub const Instr = union(enum) {
     num: f64,
     bool: bool,
     null,
-    str: packed struct {
+    short_str: [8]u8,
+    long_str: packed struct {
         index: u32,
         len: u32,
     },

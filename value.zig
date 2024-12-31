@@ -7,19 +7,27 @@ pub const Value = union(enum) {
     num: f64,
     bool: bool,
     null,
+    str: [8]u8,
     nil,
     builtin: *const fn (*Runner, ?*Cons) Runner.Error!Value,
     obj: *Obj,
 
     pub fn eql(self: Value, other: Value) bool {
+        if (self.toStr()) |self_content| {
+            const other_content = other.toStr() orelse return false;
+            return std.mem.eql(u8, self_content, other_content);
+        }
+
         return switch (self) {
             .num => |value| other == .num and value == other.num,
             .bool => |value| other == .bool and value == other.bool,
             .null => other == .null,
+            .str => unreachable,
             .nil => other == .nil,
             .builtin => |value| other == .builtin and value == other.builtin,
             .obj => |obj| other == .obj and (obj == other.obj or
                 (obj.type == other.obj.type and switch (obj.type) {
+                .str => unreachable,
                 inline else => |obj_type| obj_type.detailed(obj).eql(obj_type.detailed(other.obj)),
             })),
         };
@@ -30,6 +38,7 @@ pub const Value = union(enum) {
             .num => |value| value != 0,
             .bool => |value| value,
             .null => false,
+            .str => |value| value[0] != 0,
             .nil => false,
             .builtin => false,
             .obj => |obj| switch (obj.type) {
@@ -38,14 +47,57 @@ pub const Value = union(enum) {
         };
     }
 
-    pub fn toStr(self: Value) ?[]const u8 {
-        return switch (self) {
+    pub fn toStr(self: *const Value) ?[]const u8 {
+        return switch (self.*) {
+            .str => |*short| fromShort(short),
             .obj => |obj| switch (obj.type) {
                 .str => ObjType.str.detailed(obj).content,
                 else => null,
             },
             else => null,
         };
+    }
+
+    pub fn writeStr(content: []const u8, writer: anytype) !void {
+        try writer.print("\"", .{});
+        for (content) |char| {
+            switch (char) {
+                '\"' => try writer.print("\\\"", .{}),
+                '\\' => try writer.print("\\\\", .{}),
+                '\n' => try writer.print("\\n", .{}),
+                '\t' => try writer.print("\\t", .{}),
+                '\r' => try writer.print("\\r", .{}),
+                else => {
+                    if (std.ascii.isPrint(char)) {
+                        try writer.print("{c}", .{char});
+                    } else {
+                        try writer.print("\\x{X}", .{char});
+                    }
+                },
+            }
+        }
+        try writer.print("\"", .{});
+    }
+
+    pub fn fromShort(short: *const [8]u8) []const u8 {
+        var len: usize = 0;
+        while (len < 8 and short[len] != 0) len += 1;
+        return short[0..len];
+    }
+
+    pub fn toShort(content: []const u8) ?[8]u8 {
+        if (content.len > 8) return null;
+        var short: [8]u8 = undefined;
+        inline for (0..8) |i| {
+            if (i >= content.len) {
+                short[i] = 0;
+            } else if (content[i] == 0) {
+                return null;
+            } else {
+                short[i] = content[i];
+            }
+        }
+        return short;
     }
 
     pub fn format(self: Value, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
@@ -59,6 +111,7 @@ pub const Value = union(enum) {
                 }
             },
             .null => try writer.print("null", .{}),
+            .str => |*short| try writeStr(fromShort(short), writer),
             .nil => try writer.print("[]", .{}),
             .builtin => try writer.print("<builtin>", .{}),
             .obj => |obj| switch (obj.type) {
@@ -242,24 +295,7 @@ pub const Value = union(enum) {
         }
 
         pub fn write(self: *Str, writer: anytype) !void {
-            try writer.print("\"", .{});
-            for (self.content) |char| {
-                switch (char) {
-                    '\"' => try writer.print("\\\"", .{}),
-                    '\\' => try writer.print("\\\\", .{}),
-                    '\n' => try writer.print("\\n", .{}),
-                    '\t' => try writer.print("\\t", .{}),
-                    '\r' => try writer.print("\\r", .{}),
-                    else => {
-                        if (std.ascii.isPrint(char)) {
-                            try writer.print("{c}", .{char});
-                        } else {
-                            try writer.print("\\x{X}", .{char});
-                        }
-                    },
-                }
-            }
-            try writer.print("\"", .{});
+            try writeStr(self.content, writer);
         }
 
         pub const Source = union(enum) {

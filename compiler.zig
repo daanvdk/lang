@@ -4,6 +4,7 @@ const Expr = @import("expr.zig").Expr;
 const Pattern = @import("pattern.zig").Pattern;
 const Instr = @import("instr.zig").Instr;
 const Program = @import("program.zig").Program;
+const Value = @import("value.zig").Value;
 
 pub fn compile(allocator: std.mem.Allocator, expr: Expr) Compiler.Error!Program {
     var buffer = Buffer.init(allocator);
@@ -106,11 +107,16 @@ const Compiler = struct {
                 return .any;
             },
             .str => |content| {
-                const index = try self.buffer.add(content);
-                try self.instrs.append(.{ .str = .{
-                    .index = @truncate(index),
-                    .len = @truncate(content.len),
-                } });
+                if (Value.toShort(content)) |short| {
+                    try self.instrs.append(.{ .short_str = short });
+                } else {
+                    const index = try self.buffer.add(content);
+                    try self.instrs.append(.{ .long_str = .{
+                        .index = @truncate(index),
+                        .len = @truncate(content.len),
+                    } });
+                }
+                try self.compileUsage(usage);
                 return .any;
             },
             .list => |items| {
