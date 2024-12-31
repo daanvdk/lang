@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Expr = @import("expr.zig").Expr;
+const Pattern = @import("pattern.zig").Pattern;
 const Instr = @import("instr.zig").Instr;
 const Program = @import("program.zig").Program;
 
@@ -34,9 +35,23 @@ const Compiler = struct {
 
     fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
         switch (expr) {
-            inline .num, .bool, .null => |value, tag| {
-                try self.instrs.append(@unionInit(Instr, @tagName(tag), value));
+            .name => |name| {
+                var info: Info = undefined;
+                if (self.stack.get(name)) |local| {
+                    try self.instrs.append(.{ .local = local.index });
+                    info = local.info;
+                } else {
+                    std.debug.print("unknown name: {s}\n", .{name});
+                    return error.CompileError;
+                }
                 try self.compileUsage(usage);
+                return info;
+            },
+            inline .num, .bool, .null => |value, tag| {
+                if (usage != .ignored) {
+                    try self.instrs.append(@unionInit(Instr, @tagName(tag), value));
+                    try self.compileUsage(usage);
+                }
                 return .any;
             },
             inline .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge => |bin, tag| {
@@ -79,6 +94,15 @@ const Compiler = struct {
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp = self.instrs.items.len - rhs_start };
                     },
+                    .ignored => {
+                        try self.instrs.append(.{ .jmp_if = 1 });
+                        try self.instrs.append(.null);
+
+                        const rhs_start = self.instrs.items.len;
+                        info = info.merge(try self.compileExpr(bin.rhs, .ignored));
+
+                        self.instrs.items[rhs_start - 1] = .{ .jmp = self.instrs.items.len - rhs_start };
+                    },
                 }
                 return info;
             },
@@ -107,7 +131,85 @@ const Compiler = struct {
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp_if = self.instrs.items.len - rhs_start };
                     },
+                    .ignored => {
+                        try self.instrs.append(.null);
+
+                        const rhs_start = self.instrs.items.len;
+                        info = info.merge(try self.compileExpr(bin.rhs, .ignored));
+
+                        self.instrs.items[rhs_start - 1] = .{ .jmp_if = self.instrs.items.len - rhs_start };
+                    },
                 }
+                return info;
+            },
+            .match => |match| {
+                var n: usize = 0;
+                const no_match: ?Expr = while (n < match.matchers.len) : (n += 1) {
+                    const matcher = match.matchers[n];
+                    if (matcher.pattern == .ignore) break matcher.expr;
+                } else null;
+
+                if (n == 0) {
+                    _ = try self.compileExpr(match.subject, .ignored);
+                    if (no_match) |expr_| {
+                        return try self.compileExpr(expr_, usage);
+                    } else {
+                        try self.instrs.append(.no_match);
+                        return .all;
+                    }
+                }
+
+                const subject_info = try self.compileExpr(match.subject, .used);
+                var info = Info.all;
+
+                var to_end = std.ArrayList(usize).init(self.instrs.allocator);
+                defer to_end.deinit();
+
+                for (0.., match.matchers[0..n]) |i, matcher| {
+                    const has_next = i < n - 1;
+
+                    if (has_next) {
+                        try self.instrs.append(.{ .local = self.stack.size() });
+                        try self.stack.push(null);
+                    }
+
+                    const start = self.stack.size();
+                    const pattern_start = self.instrs.items.len;
+                    try self.compilePattern(matcher.pattern, subject_info, start);
+                    const pattern_end = self.instrs.items.len;
+                    info = info.merge(try self.compileExpr(matcher.expr, usage));
+
+                    while (self.stack.size() > start) {
+                        self.stack.pop();
+                        if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
+                    }
+
+                    if (has_next) {
+                        self.stack.pop();
+                        if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
+                    }
+
+                    if ((has_next or no_match != null) and usage != .returned) {
+                        try to_end.append(self.instrs.items.len);
+                        try self.instrs.append(.null);
+                    }
+
+                    for (pattern_start..pattern_end) |j| {
+                        switch (self.instrs.items[j]) {
+                            .no_match => self.instrs.items[j] = .{ .jmp = self.instrs.items.len - j - 1 },
+                            else => {},
+                        }
+                    }
+                }
+
+                if (no_match) |expr_| {
+                    info = info.merge(try self.compileExpr(expr_, usage));
+                }
+
+                for (to_end.items) |i| {
+                    self.instrs.items[i] = .{ .jmp = self.instrs.items.len - i - 1 };
+                }
+
                 return info;
             },
         }
@@ -117,11 +219,48 @@ const Compiler = struct {
         switch (usage) {
             .returned => try self.instrs.append(.ret),
             .used => {},
+            .ignored => try self.instrs.append(.{ .pop = self.stack.size() }),
         }
+    }
+
+    fn compilePattern(self: *Compiler, pattern: Pattern, info: Info, start: usize) Error!void {
+        switch (pattern) {
+            .name => |name| {
+                if (self.stack.getFromIndex(start, name)) |local| {
+                    try self.instrs.append(.{ .local = local.index });
+                    try self.instrs.append(.eq);
+                    try self.compileNoMatch(true, start, 0);
+                } else {
+                    try self.stack.push(.{ .name = name, .info = info });
+                }
+            },
+            .ignore => {
+                try self.instrs.append(.{ .pop = self.stack.size() });
+            },
+        }
+    }
+
+    fn compileNoMatch(self: *Compiler, expect: bool, start: usize, extra: usize) Error!void {
+        var end = self.stack.size() + extra;
+        const jmp = end - start + 1;
+
+        if (expect) {
+            try self.instrs.append(.{ .jmp_if = jmp });
+        } else {
+            try self.instrs.append(.{ .jmp_if = 1 });
+            try self.instrs.append(.{ .jmp = jmp });
+        }
+
+        while (end > start) {
+            end -= 1;
+            try self.instrs.append(.{ .pop = end });
+        }
+
+        try self.instrs.append(.no_match);
     }
 };
 
-const Usage = enum { returned, used };
+const Usage = enum { returned, used, ignored };
 const Info = enum {
     any,
     all,
@@ -163,7 +302,7 @@ const Stack = struct {
     }
 
     fn getFromIndex(self: *Stack, min_index: usize, name: []const u8) ?GetResult {
-        const index = self.size();
+        var index = self.size();
         while (index > min_index) {
             index -= 1;
             const entry = self.entries.items[index] orelse continue;
@@ -171,6 +310,7 @@ const Stack = struct {
                 return .{ .index = index, .info = entry.info };
             }
         }
+        return null;
     }
 
     const Entry = struct {
@@ -256,6 +396,28 @@ test "compile operators" {
         .neg,
         .div,
         .add,
+        .ret,
+    }, program.instrs);
+}
+
+test "compile var" {
+    const program = try compile(std.testing.allocator, .{ .match = &.{
+        .subject = .{ .num = 4 },
+        .matchers = &.{.{
+            .pattern = .{ .name = "x" },
+            .expr = .{ .mul = &.{
+                .lhs = .{ .name = "x" },
+                .rhs = .{ .name = "x" },
+            } },
+        }},
+    } });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .{ .num = 4 },
+        .{ .local = 0 },
+        .{ .local = 0 },
+        .mul,
         .ret,
     }, program.instrs);
 }

@@ -156,6 +156,9 @@ const Runner = struct {
                 .ret => {
                     return call.stack.pop();
                 },
+                .no_match => {
+                    return error.RunError;
+                },
             }
         }
     }
@@ -275,4 +278,22 @@ test "run operators" {
     const value = try runner.runProgram(program);
 
     try std.testing.expectEqualDeep(Value{ .num = 1.25 }, value);
+}
+
+test "compile var" {
+    var runner = Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .{ .num = 4 },
+            .{ .local = 0 },
+            .{ .local = 0 },
+            .mul,
+            .ret,
+        },
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 16 }, value);
 }

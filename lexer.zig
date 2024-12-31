@@ -67,8 +67,7 @@ pub const Lexer = struct {
                     }
                 }
 
-                self.index = start;
-                return null;
+                return .name;
             },
             '0'...'9' => {
                 var has_decimal = false;
@@ -116,8 +115,7 @@ pub const Lexer = struct {
                     if (char1 == '=') return .eq;
                     self.pushChar(char1);
                 }
-                self.pushChar(char0);
-                return null;
+                return .assign;
             },
             '!' => {
                 if (self.nextChar()) |char1| {
@@ -201,6 +199,7 @@ pub const Lexer = struct {
     const keywords = .{
         .bool = .{ "true", "false" },
         .null = .{"null"},
+        .ignore = .{"_"},
         .not = .{"not"},
         .@"and" = .{"and"},
         .@"or" = .{"or"},

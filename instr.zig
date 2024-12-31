@@ -26,4 +26,5 @@ pub const Instr = union(enum) {
     jmp_if: usize,
 
     ret,
+    no_match,
 };

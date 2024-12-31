@@ -3,9 +3,11 @@ pub const Token = struct {
     content: []const u8,
 
     pub const Type = enum {
+        name,
         num,
         bool,
         null,
+        ignore,
 
         lpar,
         rpar,
@@ -26,6 +28,8 @@ pub const Token = struct {
         not,
         @"and",
         @"or",
+
+        assign,
 
         space,
         newline,

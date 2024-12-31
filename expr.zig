@@ -1,6 +1,9 @@
 const std = @import("std");
 
+const Pattern = @import("pattern.zig").Pattern;
+
 pub const Expr = union(enum) {
+    name: []const u8,
     num: f64,
     bool: bool,
     null,
@@ -24,10 +27,12 @@ pub const Expr = union(enum) {
     @"and": *const Bin,
     @"or": *const Bin,
 
+    match: *const Match,
+
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
-            .num, .bool, .null => {},
-            inline .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or" => |value| {
+            .name, .num, .bool, .null => {},
+            inline .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match => |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
             },
@@ -41,6 +46,27 @@ pub const Expr = union(enum) {
         pub fn deinit(self: Bin, allocator: std.mem.Allocator) void {
             self.lhs.deinit(allocator);
             self.rhs.deinit(allocator);
+        }
+    };
+
+    pub const Match = struct {
+        subject: Expr,
+        matchers: []const Matcher,
+
+        pub fn deinit(self: Match, allocator: std.mem.Allocator) void {
+            self.subject.deinit(allocator);
+            for (self.matchers) |matcher| matcher.deinit(allocator);
+            allocator.free(self.matchers);
+        }
+    };
+
+    pub const Matcher = struct {
+        pattern: Pattern,
+        expr: Expr,
+
+        pub fn deinit(self: Matcher, allocator: std.mem.Allocator) void {
+            self.pattern.deinit(allocator);
+            self.expr.deinit(allocator);
         }
     };
 };
