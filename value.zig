@@ -47,6 +47,13 @@ pub const Value = union(enum) {
         };
     }
 
+    pub fn mark(self: Value) void {
+        switch (self) {
+            .obj => |obj| obj.mark(),
+            else => {},
+        }
+    }
+
     pub fn toStr(self: *const Value) ?[]const u8 {
         return switch (self.*) {
             .str => |*short| fromShort(short),
@@ -123,9 +130,18 @@ pub const Value = union(enum) {
     pub const Obj = struct {
         type: ObjType,
         prev: ?*Obj,
+        seen: bool,
 
         pub fn toValue(self: *Obj) Value {
             return .{ .obj = self };
+        }
+
+        pub fn mark(self: *Obj) void {
+            if (self.seen) return;
+            self.seen = true;
+            switch (self.type) {
+                inline else => |obj_type| obj_type.detailed(self).mark(),
+            }
         }
     };
 
@@ -162,7 +178,13 @@ pub const Value = union(enum) {
             return true;
         }
 
-        pub fn deinit(self: Program, allocator: std.mem.Allocator) void {
+        pub fn allocated(self: *Program) usize {
+            return @sizeOf(Instr) * self.instrs.len + @sizeOf(u8) * self.data.len;
+        }
+
+        pub fn mark(_: *Program) void {}
+
+        pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
             allocator.free(self.instrs);
             allocator.free(self.data);
         }
@@ -191,7 +213,16 @@ pub const Value = union(enum) {
             return true;
         }
 
-        pub fn deinit(_: Cons, _: std.mem.Allocator) void {}
+        pub fn allocated(_: *Cons) usize {
+            return 0;
+        }
+
+        pub fn mark(self: *Cons) void {
+            self.head.mark();
+            if (self.tail) |tail| tail.obj.mark();
+        }
+
+        pub fn deinit(_: *Cons, _: std.mem.Allocator) void {}
 
         pub fn write(self: *Cons, writer: anytype) !void {
             try writer.print("[{}", .{self.head});
@@ -268,7 +299,16 @@ pub const Value = union(enum) {
             return true;
         }
 
-        pub fn deinit(self: Lambda, allocator: std.mem.Allocator) void {
+        pub fn allocated(self: *Lambda) usize {
+            return @sizeOf(Value) * self.stack.len;
+        }
+
+        pub fn mark(self: *Lambda) void {
+            self.program.obj.mark();
+            for (self.stack) |value| value.mark();
+        }
+
+        pub fn deinit(self: *Lambda, allocator: std.mem.Allocator) void {
             allocator.free(self.stack);
         }
 
@@ -290,7 +330,21 @@ pub const Value = union(enum) {
             return self.content.len > 0;
         }
 
-        pub fn deinit(self: Str, allocator: std.mem.Allocator) void {
+        pub fn allocated(self: *Str) usize {
+            return switch (self.source) {
+                .alloc => @sizeOf(u8) * self.content.len,
+                else => 0,
+            };
+        }
+
+        pub fn mark(self: *Str) void {
+            switch (self.source) {
+                inline .slice, .data => |value| value.obj.mark(),
+                else => {},
+            }
+        }
+
+        pub fn deinit(self: *Str, allocator: std.mem.Allocator) void {
             if (self.source == .alloc) allocator.free(self.content);
         }
 

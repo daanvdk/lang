@@ -129,10 +129,15 @@ const StdlibValues = values: {
 };
 
 pub const Runner = struct {
+    const min_next_gc = 8 * 1024;
+
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(*Call) = .{},
     last: ?*Value.Obj = null,
     stdlib_values: StdlibValues,
+
+    next_gc: usize,
+    allocated: usize = 0,
 
     pub const Error = std.mem.Allocator.Error || error{RunError};
 
@@ -168,6 +173,7 @@ pub const Runner = struct {
         var self = Runner{
             .allocator = allocator,
             .stdlib_values = undefined,
+            .next_gc = std.math.maxInt(usize),
         };
         errdefer self.deinit();
 
@@ -184,6 +190,9 @@ pub const Runner = struct {
             defer call.stack.deinit(allocator);
             @field(self.stdlib_values, field.name) = try self.run(&call);
         }
+
+        self.next_gc = 0;
+        self.checkGc();
 
         return self;
     }
@@ -209,9 +218,47 @@ pub const Runner = struct {
         detail.obj = .{
             .type = obj_type,
             .prev = self.last,
+            .seen = false,
         };
         self.last = &detail.obj;
+        self.allocated += @sizeOf(obj_type.Detail()) + detail.allocated();
         return detail;
+    }
+
+    fn checkGc(self: *Runner) void {
+        if (self.allocated >= self.next_gc) {
+            self.runGc();
+            self.next_gc = @max(self.allocated * 2, min_next_gc);
+        }
+    }
+
+    fn runGc(self: *Runner) void {
+        inline for (@typeInfo(Stdlib).Struct.fields) |field| {
+            @field(self.stdlib_values, field.name).mark();
+        }
+
+        for (self.calls.items) |call| {
+            call.program.obj.mark();
+            for (call.stack.items) |value| value.mark();
+        }
+
+        var curr = &self.last;
+        while (curr.*) |obj| {
+            if (obj.seen) {
+                curr = &obj.prev;
+                obj.seen = false;
+            } else {
+                curr.* = obj.prev;
+                switch (obj.type) {
+                    inline else => |obj_type| {
+                        const detail = obj_type.detailed(obj);
+                        self.allocated -= @sizeOf(obj_type.Detail()) + detail.allocated();
+                        detail.deinit(self.allocator);
+                        self.allocator.destroy(detail);
+                    },
+                }
+            }
+        }
     }
 
     fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !Value {
@@ -456,6 +503,7 @@ pub const Runner = struct {
                 },
             }
         }
+        self.checkGc();
     }
 
     fn expectNum(value: Value) !f64 {
