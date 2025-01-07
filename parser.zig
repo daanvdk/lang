@@ -651,7 +651,10 @@ const Parser = struct {
         errdefer body.expr.deinit(self.allocator);
 
         const for_ = try self.allocator.create(Expr.For);
-        for_.* = .{ .pattern = pattern, .subject = subject, .expr = body.expr };
+        for_.* = .{
+            .subject = subject,
+            .matcher = .{ .pattern = pattern, .expr = body.expr },
+        };
         return .{ .@"for" = for_ };
     }
 

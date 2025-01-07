@@ -175,6 +175,7 @@ pub const Compiler = struct {
             inline .lambda, .gen => |value, tag| {
                 var compiler = Compiler.init(self.buffer);
                 defer compiler.deinit();
+                if (tag == .gen) compiler.is_gen = true;
 
                 compiler.scope = try self.scope.clone();
                 for (self.stack.entries.items) |maybe_entry| {
@@ -182,17 +183,14 @@ pub const Compiler = struct {
                     try compiler.scope.put(entry.name, entry.info);
                 }
 
-                try compiler.compilePattern(switch (tag) {
-                    .lambda => value.pattern,
-                    .gen => .{ .list = &.{.{ .expr = &.null }} },
+                _ = try compiler.compileMatcher(switch (tag) {
+                    .lambda => value.*,
+                    .gen => .{
+                        .pattern = .{ .list = &.{.{ .expr = &.null }} },
+                        .expr = value.*,
+                    },
                     else => unreachable,
-                }, .list, 0);
-                if (tag == .gen) compiler.is_gen = true;
-                _ = try compiler.compileExpr(switch (tag) {
-                    .lambda => value.expr,
-                    .gen => value.*,
-                    else => unreachable,
-                }, .returned);
+                }, .list, null, .returned);
 
                 var caps = std.StringHashMap(usize).init(self.instrs.allocator);
                 defer caps.deinit();
@@ -257,7 +255,7 @@ pub const Compiler = struct {
                         self.instrs.items[ret_start - 1] = .{ .jmp_if = self.instrs.items.len - ret_start };
 
                         try self.instrs.append(.{ .pop = self.stack.size() });
-                        info = info.merge(try self.compileExpr(bin.rhs, .returned));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
                     },
                     .used => {
                         try self.instrs.append(.{ .local = self.stack.size() });
@@ -266,7 +264,7 @@ pub const Compiler = struct {
 
                         const rhs_start = self.instrs.items.len;
                         try self.instrs.append(.{ .pop = self.stack.size() });
-                        info = info.merge(try self.compileExpr(bin.rhs, .used));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp = self.instrs.items.len - rhs_start };
                     },
@@ -275,7 +273,7 @@ pub const Compiler = struct {
                         try self.instrs.append(.null);
 
                         const rhs_start = self.instrs.items.len;
-                        info = info.merge(try self.compileExpr(bin.rhs, .ignored));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp = self.instrs.items.len - rhs_start };
                     },
@@ -295,7 +293,7 @@ pub const Compiler = struct {
                         self.instrs.items[ret_start - 1] = .{ .jmp = self.instrs.items.len - ret_start };
 
                         try self.instrs.append(.{ .pop = self.stack.size() });
-                        info = info.merge(try self.compileExpr(bin.rhs, .returned));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
                     },
                     .used => {
                         try self.instrs.append(.{ .local = self.stack.size() });
@@ -303,7 +301,7 @@ pub const Compiler = struct {
 
                         const rhs_start = self.instrs.items.len;
                         try self.instrs.append(.{ .pop = self.stack.size() });
-                        info = info.merge(try self.compileExpr(bin.rhs, .used));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp_if = self.instrs.items.len - rhs_start };
                     },
@@ -311,7 +309,7 @@ pub const Compiler = struct {
                         try self.instrs.append(.null);
 
                         const rhs_start = self.instrs.items.len;
-                        info = info.merge(try self.compileExpr(bin.rhs, .ignored));
+                        info = info.merge(try self.compileExpr(bin.rhs, usage));
 
                         self.instrs.items[rhs_start - 1] = .{ .jmp_if = self.instrs.items.len - rhs_start };
                     },
@@ -342,39 +340,30 @@ pub const Compiler = struct {
                 defer to_end.deinit();
 
                 for (0.., match.matchers[0..n]) |i, matcher| {
-                    const has_next = i < n - 1;
+                    const has_next_matcher = i < n - 1;
+                    const has_next = has_next_matcher or no_match != null;
 
-                    if (has_next) {
+                    if (has_next_matcher) {
                         try self.instrs.append(.{ .local = self.stack.size() });
                         try self.stack.push(null);
                     }
 
-                    const start = self.stack.size();
-                    const pattern_start = self.instrs.items.len;
-                    try self.compilePattern(matcher.pattern, subject_info, start);
-                    const pattern_end = self.instrs.items.len;
-                    info = info.merge(try self.compileExpr(matcher.expr, usage));
+                    var to_next = std.ArrayList(usize).init(self.instrs.allocator);
+                    defer to_next.deinit();
+                    info = info.merge(try self.compileMatcher(matcher, subject_info, if (has_next) &to_next else null, usage));
 
-                    while (self.stack.size() > start) {
+                    if (has_next_matcher) {
                         self.stack.pop();
                         if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
                     }
 
-                    if (has_next) {
-                        self.stack.pop();
-                        if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
-                    }
-
-                    if ((has_next or no_match != null) and usage != .returned) {
+                    if (has_next and usage != .returned) {
                         try to_end.append(self.instrs.items.len);
                         try self.instrs.append(.null);
                     }
 
-                    for (pattern_start..pattern_end) |j| {
-                        switch (self.instrs.items[j]) {
-                            .no_match => self.instrs.items[j] = .{ .jmp = self.instrs.items.len - j - 1 },
-                            else => {},
-                        }
+                    for (to_next.items) |j| {
+                        self.instrs.items[j] = .{ .jmp = self.instrs.items.len - j - 1 };
                     }
                 }
 
@@ -415,7 +404,7 @@ pub const Compiler = struct {
                 try self.instrs.append(.yield);
 
                 const start = self.stack.size();
-                try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .list, start);
+                try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .list, null, start);
                 self.stack.entries.shrinkRetainingCapacity(start);
 
                 try self.compileUsage(usage);
@@ -446,7 +435,7 @@ pub const Compiler = struct {
 
                 try self.instrs.append(.call);
                 const start = self.stack.size();
-                try self.compilePattern(.{ .list = &.{ .{ .name = "head" }, .{ .name = "tail" } } }, .any, start);
+                try self.compilePattern(.{ .list = &.{ .{ .name = "head" }, .{ .name = "tail" } } }, .any, null, start);
                 self.stack.entries.shrinkRetainingCapacity(start);
                 try self.instrs.append(.{ .local = start + 1 });
                 try self.instrs.append(.null);
@@ -464,16 +453,11 @@ pub const Compiler = struct {
 
                 switch (tag) {
                     .@"for" => {
-                        try self.compilePattern(value.pattern, .any, start + 2);
-                        _ = try self.compileExpr(value.expr, .used);
-                        while (self.stack.size() > start + 2) {
-                            self.stack.pop();
-                            try self.instrs.append(.{ .pop = self.stack.size() });
-                        }
+                        _ = try self.compileMatcher(value.matcher, .any, null, .used);
                     },
                     .yield_all => {
                         try self.instrs.append(.yield);
-                        try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .any, start + 2);
+                        try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .any, null, start + 2);
                         self.stack.entries.shrinkRetainingCapacity(start + 2);
                     },
                     else => unreachable,
@@ -515,13 +499,19 @@ pub const Compiler = struct {
         }
     }
 
-    fn compilePattern(self: *Compiler, pattern: Pattern, info: Info, start: usize) Error!void {
+    fn compilePattern(
+        self: *Compiler,
+        pattern: Pattern,
+        info: Info,
+        to_next: ?*std.ArrayList(usize),
+        start: usize,
+    ) Error!void {
         switch (pattern) {
             .name => |name| {
                 if (self.stack.getFromIndex(start, name)) |local| {
                     try self.instrs.append(.{ .local = local.index });
                     try self.instrs.append(.eq);
-                    try self.compileNoMatch(true, start, 0);
+                    try self.compileNoMatch(true, to_next, start, 0);
                 } else {
                     try self.stack.push(.{ .name = name, .info = info });
                 }
@@ -530,13 +520,17 @@ pub const Compiler = struct {
                 try self.instrs.append(.{ .pop = self.stack.size() });
             },
             .expr => |expr| {
+                const old_is_gen = self.is_gen;
+                defer self.is_gen = old_is_gen;
+                self.is_gen = false;
+
                 try self.stack.push(null);
                 _ = try self.compileExpr(expr.*, .used);
                 self.stack.pop();
                 try self.instrs.append(.eq);
-                try self.compileNoMatch(true, start, 0);
+                try self.compileNoMatch(true, to_next, start, 0);
             },
-            .list => try self.compilePattern(.{ .lists = &.{pattern} }, info, start),
+            .list => try self.compilePattern(.{ .lists = &.{pattern} }, info, to_next, start),
             .lists => |cols| {
                 if (!info.isList()) {
                     try self.instrs.append(.{ .global = .is_list });
@@ -544,14 +538,14 @@ pub const Compiler = struct {
                     try self.instrs.append(.nil);
                     try self.instrs.append(.cons);
                     try self.instrs.append(.call);
-                    try self.compileNoMatch(true, start, 1);
+                    try self.compileNoMatch(true, to_next, start, 1);
                 }
 
                 var i: usize = 0;
                 while (i < cols.len and cols[i] == .list) : (i += 1) {
                     for (cols[i].list) |item| {
                         try self.instrs.append(.{ .local = self.stack.size() });
-                        try self.compileNoMatch(true, start, 1);
+                        try self.compileNoMatch(true, to_next, start, 1);
                         try self.instrs.append(.decons);
 
                         if (item == .name and self.stack.getFromIndex(start, item.name) == null) {
@@ -564,7 +558,7 @@ pub const Compiler = struct {
                             try self.instrs.append(.{ .pop = curr });
 
                             try self.stack.push(null);
-                            try self.compilePattern(item, .any, start);
+                            try self.compilePattern(item, .any, to_next, start);
                             _ = self.stack.entries.orderedRemove(start);
 
                             if (self.stack.size() != curr) {
@@ -576,15 +570,21 @@ pub const Compiler = struct {
                 }
 
                 switch (cols.len - i) {
-                    0 => try self.compileNoMatch(false, start, 0),
-                    1 => try self.compilePattern(cols[i], .list, start),
+                    0 => try self.compileNoMatch(false, to_next, start, 0),
+                    1 => try self.compilePattern(cols[i], .list, to_next, start),
                     else => unreachable,
                 }
             },
         }
     }
 
-    fn compileNoMatch(self: *Compiler, expect: bool, start: usize, extra: usize) Error!void {
+    fn compileNoMatch(
+        self: *Compiler,
+        expect: bool,
+        to_next: ?*std.ArrayList(usize),
+        start: usize,
+        extra: usize,
+    ) Error!void {
         var end = self.stack.size() + extra;
         const jmp = end - start + 1;
 
@@ -600,7 +600,28 @@ pub const Compiler = struct {
             try self.instrs.append(.{ .pop = end });
         }
 
+        if (to_next) |to_next_| try to_next_.append(self.instrs.items.len);
         try self.instrs.append(.no_match);
+    }
+
+    fn compileMatcher(
+        self: *Compiler,
+        matcher: Expr.Matcher,
+        subject_info: Info,
+        to_next: ?*std.ArrayList(usize),
+        usage: Usage,
+    ) Error!Info {
+        const start = self.stack.size();
+
+        try self.compilePattern(matcher.pattern, subject_info, to_next, start);
+        const info = try self.compileExpr(matcher.expr, usage);
+
+        while (self.stack.size() > start) {
+            self.stack.pop();
+            if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
+        }
+
+        return info;
     }
 
     fn insertInstr(self: *Compiler, index: usize, instr: Instr) !void {
@@ -615,7 +636,8 @@ pub const Compiler = struct {
     }
 };
 
-const Usage = enum { returned, used, ignored };
+const Usage = union(enum) { returned, used, ignored };
+
 const Info = enum {
     any,
     list,

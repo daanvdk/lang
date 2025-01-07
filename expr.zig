@@ -52,7 +52,7 @@ pub const Expr = union(enum) {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all, .@"return" => |value| {
+            inline else => |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
             },
@@ -75,7 +75,7 @@ pub const Expr = union(enum) {
                 }
                 return @unionInit(Expr, @tagName(tag), copies);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all, .@"return" => |value, tag| {
+            inline else => |value, tag| {
                 const copy = try allocator.create(@TypeOf(value.*));
                 errdefer allocator.destroy(copy);
                 copy.* = try value.clone(allocator);
@@ -171,23 +171,19 @@ pub const Expr = union(enum) {
     };
 
     pub const For = struct {
-        pattern: Pattern,
         subject: Expr,
-        expr: Expr,
+        matcher: Matcher,
 
         pub fn deinit(self: For, allocator: std.mem.Allocator) void {
-            self.pattern.deinit(allocator);
             self.subject.deinit(allocator);
-            self.expr.deinit(allocator);
+            self.matcher.deinit(allocator);
         }
 
         pub fn clone(self: For, allocator: std.mem.Allocator) std.mem.Allocator.Error!For {
             var copy: For = undefined;
-            copy.pattern = try self.pattern.clone(allocator);
-            errdefer copy.pattern.deinit(allocator);
             copy.subject = try self.subject.clone(allocator);
             errdefer copy.subject.deinit(allocator);
-            copy.expr = try self.expr.clone(allocator);
+            copy.matcher = try self.matcher.clone(allocator);
             return copy;
         }
     };
