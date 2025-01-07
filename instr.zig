@@ -48,7 +48,12 @@ pub const Instr = union(enum) {
     no_match,
 
     pub const Global = enum {
+        is_num,
+        is_bool,
+        is_null,
+        is_str,
         is_list,
+        is_func,
         str,
         join,
         print,
@@ -60,5 +65,7 @@ pub const Instr = union(enum) {
         filter,
         reduce,
         count,
+
+        @"@str_send",
     };
 };

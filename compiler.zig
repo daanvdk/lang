@@ -492,6 +492,10 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .any;
             },
+            .@"return" => |expr_ptr| {
+                _ = try self.compileExpr(expr_ptr.*, .returned);
+                return .all;
+            },
         }
     }
 

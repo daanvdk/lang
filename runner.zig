@@ -3,7 +3,7 @@ const std = @import("std");
 const Program = @import("program.zig").Program;
 const Instr = @import("instr.zig").Instr;
 const Value = @import("value.zig").Value;
-const parse = @import("parser.zig").parse;
+const internal_parse = @import("parser.zig").internal_parse;
 const Buffer = @import("compiler.zig").Buffer;
 const Compiler = @import("compiler.zig").Compiler;
 
@@ -15,12 +15,18 @@ pub fn run(allocator: std.mem.Allocator, program: Program) Runner.Error!void {
 
 const stdlib = .{
     .send = (
-        \\|iter, value| match iter do
-        \\  [*list] = match list do
-        \\    [head, *tail] = [head, tail]
-        \\    _             = [null, null]
+        \\|iter, value| do
+        \\  if [*list] = iter do
+        \\    if [head, *tail] = list do
+        \\      [head, tail]
+        \\    else
+        \\      [null, null]
+        \\    end
+        \\  elif is_str(iter) do
+        \\    @str_send(iter)
+        \\  else
+        \\    iter(value)
         \\  end
-        \\  _ = iter(value)
         \\end
     ),
     .next = (
@@ -34,16 +40,16 @@ const stdlib = .{
         \\end
     ),
     .list = (
-        \\|*iters| match iters do
-        \\  [[*list]] = list
-        \\  [iter, *iters] = match next(iter) do
-        \\    [head, tail] = do
-        \\      [*tail] = list(tail, *iters)
-        \\      [head, *tail]
-        \\    end
-        \\    _ = list(*iters)
+        \\|*iters| do
+        \\  [iter, *iters] = iters else return []
+        \\  if is_list(iter) and not iters do
+        \\    iter
+        \\  elif [head, tail] = next(iter) do
+        \\    [*tail] = list(tail, *iters)
+        \\    [head, *tail]
+        \\  else
+        \\    list(*iters)
         \\  end
-        \\  _ = []
         \\end
     ),
     .map = (
@@ -61,9 +67,9 @@ const stdlib = .{
         \\end
     ),
     .reduce = (
-        \\|iter, f, acc| match next(iter) do
-        \\  [head, tail] = reduce(tail, f, f(acc, head))
-        \\  _ = acc
+        \\|iter, f, acc| do
+        \\  [head, tail] = next(iter) else return acc
+        \\  reduce(tail, f, f(acc, head))
         \\end
     ),
     .count = (
@@ -142,7 +148,7 @@ pub const Runner = struct {
             inline for (@typeInfo(Stdlib).Struct.fields) |field| {
                 @field(offsets, field.name) = compiler.instrs.items.len;
                 const content = @field(stdlib, field.name);
-                const expr = parse(allocator, content) catch |err| switch (err) {
+                const expr = internal_parse(allocator, content) catch |err| switch (err) {
                     error.ParseError => unreachable,
                     inline else => |err_| return err_,
                 };
@@ -459,6 +465,10 @@ pub const Runner = struct {
         };
     }
 
+    fn expectStr(value: *const Value) ![]const u8 {
+        return value.toStr() orelse error.RunError;
+    }
+
     fn expectCons(value: Value) !*Value.Cons {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
@@ -513,11 +523,44 @@ pub const Runner = struct {
     };
 
     const Builtins = struct {
+        fn is_num(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = arg == .num };
+        }
+
+        fn is_bool(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = arg == .bool };
+        }
+
+        fn is_null(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = arg == .null };
+        }
+
+        fn is_str(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = switch (arg) {
+                .str => true,
+                .obj => |obj| obj.type == .str,
+                else => false,
+            } };
+        }
+
         fn is_list(_: *Runner, args: ?*Value.Cons) Error!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = switch (arg) {
                 .nil => true,
                 .obj => |obj| obj.type == .cons,
+                else => false,
+            } };
+        }
+
+        fn is_func(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = switch (arg) {
+                .builtin => true,
+                .obj => |obj| obj.type == .lambda,
                 else => false,
             } };
         }
@@ -606,7 +649,41 @@ pub const Runner = struct {
 
             return .null;
         }
+
+        fn @"@str_send"(self: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            const content = try expectStr(&arg);
+
+            var head: Value = undefined;
+            var tail: Value = undefined;
+            if (initCharLen(content)) |char_len| {
+                head = try self.strSlice(arg, content[0..char_len]);
+                tail = try self.strSlice(arg, content[char_len..]);
+            } else {
+                head = .null;
+                tail = .null;
+            }
+
+            return try self.createListValue(&.{ head, tail });
+        }
     };
+
+    fn initCharLen(content: []const u8) ?usize {
+        if (content.len == 0) return null;
+        return 1;
+    }
+
+    fn strSlice(self: *Runner, value: Value, content: []const u8) Error!Value {
+        if (Value.toShort(content)) |short| return .{ .str = short };
+        const str = Value.ObjType.str.detailed(value.obj);
+        return try self.createValue(.str, .{
+            .content = content,
+            .source = switch (str.source) {
+                .alloc => .{ .slice = str },
+                else => str.source,
+            },
+        });
+    }
 
     fn next(self: *Runner, iter: Value) Error!?[2]Value {
         const result = try self.runGlobal("next", &.{iter});
@@ -633,11 +710,12 @@ pub const Runner = struct {
 fn cloneProgram(program: Program) !Program {
     return .{
         .instrs = try std.testing.allocator.dupe(Instr, program.instrs),
+        .data = try std.testing.allocator.dupe(u8, program.data),
     };
 }
 
 test "run num 1" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -653,7 +731,7 @@ test "run num 1" {
 }
 
 test "run num 2" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -669,7 +747,7 @@ test "run num 2" {
 }
 
 test "run bool 1" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -685,7 +763,7 @@ test "run bool 1" {
 }
 
 test "run bool 2" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -701,7 +779,7 @@ test "run bool 2" {
 }
 
 test "run null" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -717,7 +795,7 @@ test "run null" {
 }
 
 test "run operators" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -740,7 +818,7 @@ test "run operators" {
 }
 
 test "run var" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -759,7 +837,7 @@ test "run var" {
 }
 
 test "run lambda" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{
@@ -792,7 +870,7 @@ test "run lambda" {
 }
 
 test "run closure" {
-    var runner = Runner.init(std.testing.allocator);
+    var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
 
     const program = try cloneProgram(.{

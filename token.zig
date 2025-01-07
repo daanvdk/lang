@@ -49,6 +49,7 @@ pub const Token = struct {
         @"for",
         in,
         yield,
+        @"return",
 
         space,
         comment,

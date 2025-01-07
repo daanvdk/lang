@@ -11,6 +11,13 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) Parser.Error!Exp
     return body.expr;
 }
 
+pub fn internal_parse(allocator: std.mem.Allocator, content: []const u8) Parser.Error!Expr {
+    var parser = Parser.init(allocator, content);
+    parser.lexer.internal = true;
+    const body = try parser.parseBody(&.{.eof});
+    return body.expr;
+}
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     lexer: Lexer,
@@ -30,7 +37,7 @@ const Parser = struct {
     }
 
     fn parseBody(self: *Parser, ends: []const Token.Type) Error!Body {
-        var lets = std.ArrayList(Expr.Matcher).init(self.allocator);
+        var lets = std.ArrayList(Let).init(self.allocator);
         var last_expr: ?Expr = null;
         defer {
             for (lets.items) |let| let.deinit(self.allocator);
@@ -47,7 +54,11 @@ const Parser = struct {
             if (self.skip(ends)) |end| break end;
 
             if (last_expr) |expr| {
-                try lets.append(.{ .pattern = .ignore, .expr = expr });
+                try lets.append(.{
+                    .pattern = .ignore,
+                    .expr = expr,
+                    .default = null,
+                });
                 last_expr = null;
             }
 
@@ -69,7 +80,20 @@ const Parser = struct {
                 const expr = try self.parseExpr(.expr);
                 errdefer expr.deinit(self.allocator);
 
-                try lets.append(.{ .pattern = pattern, .expr = expr });
+                var default: ?Expr = undefined;
+                if (self.skip(&.{.@"else"}) == null) {
+                    default = null;
+                } else {
+                    _ = try self.expect(&.{.@"return"});
+                    default = try self.parseExpr(.expr);
+                }
+                errdefer if (default) |default_| default_.deinit(self.allocator);
+
+                try lets.append(.{
+                    .pattern = pattern,
+                    .expr = expr,
+                    .default = default,
+                });
             } else {
                 last_expr = ParseType.both.toExpr(self.allocator, result);
             }
@@ -84,9 +108,10 @@ const Parser = struct {
         while (lets.popOrNull()) |let| {
             errdefer let.deinit(self.allocator);
 
-            const matchers = try self.allocator.alloc(Expr.Matcher, 1);
+            const matchers = try self.allocator.alloc(Expr.Matcher, if (let.default == null) 1 else 2);
             errdefer self.allocator.free(matchers);
             matchers[0] = .{ .pattern = let.pattern, .expr = expr };
+            if (let.default) |default| matchers[1] = .{ .pattern = .ignore, .expr = default };
 
             const match = try self.allocator.create(Expr.Match);
             match.* = .{ .subject = let.expr, .matchers = matchers };
@@ -305,6 +330,8 @@ const Parser = struct {
             return parse_type.fromExpr(try self.parseFor());
         } else if (parse_type != .pattern and self.is_gen and self.peek(&.{.yield})) {
             return parse_type.fromExpr(try self.parseYield());
+        } else if (parse_type != .pattern and self.peek(&.{.@"return"})) {
+            return parse_type.fromExpr(try self.parseReturn());
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -527,21 +554,40 @@ const Parser = struct {
         defer self.skip_newlines = old_skip;
         self.skip_newlines = true;
 
-        var conds = std.ArrayList(Expr.Bin).init(self.allocator);
+        var branches = std.ArrayList(IfBranch).init(self.allocator);
         defer {
-            for (conds.items) |cond| cond.deinit(self.allocator);
-            conds.deinit();
+            for (branches.items) |branch| branch.deinit(self.allocator);
+            branches.deinit();
         }
 
         const has_else = while (true) {
-            const cond = try self.parseExpr(.expr);
+            const result = try self.parseExpr(.both);
+            const assign = switch (result) {
+                .expr => false,
+                .pattern => assign: {
+                    errdefer result.deinit(self.allocator);
+                    _ = try self.expect(&.{.assign});
+                    break :assign true;
+                },
+                .both => self.skip(&.{.assign}) != null,
+            };
+
+            var cond: IfCond = undefined;
+            if (assign) {
+                const pattern = ParseType.both.toPattern(self.allocator, result);
+                errdefer pattern.deinit(self.allocator);
+                const expr = try self.parseExpr(.expr);
+                cond = .{ .match = .{ .pattern = pattern, .expr = expr } };
+            } else {
+                cond = .{ .@"if" = ParseType.both.toExpr(self.allocator, result) };
+            }
             errdefer cond.deinit(self.allocator);
 
             _ = try self.expect(&.{.do});
             const body = try self.parseBody(&.{ .elif, .@"else", .end });
             errdefer body.expr.deinit(self.allocator);
 
-            try conds.append(.{ .lhs = cond, .rhs = body.expr });
+            try branches.append(.{ .cond = cond, .then = body.expr });
 
             switch (body.end.type) {
                 .elif => {},
@@ -560,11 +606,25 @@ const Parser = struct {
         }
         errdefer expr.deinit(self.allocator);
 
-        while (conds.popOrNull()) |cond| {
-            errdefer cond.deinit(self.allocator);
-            const if_ = try self.allocator.create(Expr.If);
-            if_.* = .{ .cond = cond.lhs, .then = cond.rhs, .else_ = expr };
-            expr = .{ .@"if" = if_ };
+        while (branches.popOrNull()) |branch| {
+            errdefer branch.deinit(self.allocator);
+            switch (branch.cond) {
+                .@"if" => |cond| {
+                    const if_ = try self.allocator.create(Expr.If);
+                    if_.* = .{ .cond = cond, .then = branch.then, .else_ = expr };
+                    expr = .{ .@"if" = if_ };
+                },
+                .match => |cond| {
+                    const matchers = try self.allocator.alloc(Expr.Matcher, 2);
+                    errdefer self.allocator.free(matchers);
+                    matchers[0] = .{ .pattern = cond.pattern, .expr = branch.then };
+                    matchers[1] = .{ .pattern = .ignore, .expr = expr };
+
+                    const match = try self.allocator.create(Expr.Match);
+                    match.* = .{ .subject = cond.expr, .matchers = matchers };
+                    expr = .{ .match = match };
+                },
+            }
         }
 
         return expr;
@@ -605,6 +665,16 @@ const Parser = struct {
         expr.* = try self.parseExpr(.expr);
 
         return if (is_all) .{ .yield_all = expr } else .{ .yield = expr };
+    }
+
+    fn parseReturn(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.@"return"});
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseExpr(.expr);
+
+        return .{ .@"return" = expr };
     }
 
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
@@ -918,6 +988,39 @@ fn ListState(comptime parse_type: ParseType) type {
         }
     };
 }
+
+const Let = struct {
+    pattern: Pattern,
+    expr: Expr,
+    default: ?Expr,
+
+    fn deinit(self: Let, allocator: std.mem.Allocator) void {
+        self.pattern.deinit(allocator);
+        self.expr.deinit(allocator);
+        if (self.default) |expr| expr.deinit(allocator);
+    }
+};
+
+const IfCond = union(enum) {
+    @"if": Expr,
+    match: Expr.Matcher,
+
+    fn deinit(self: IfCond, allocator: std.mem.Allocator) void {
+        switch (self) {
+            inline else => |value| value.deinit(allocator),
+        }
+    }
+};
+
+const IfBranch = struct {
+    cond: IfCond,
+    then: Expr,
+
+    fn deinit(self: IfBranch, allocator: std.mem.Allocator) void {
+        self.cond.deinit(allocator);
+        self.then.deinit(allocator);
+    }
+};
 
 test "parse num 1" {
     const expr = try parse(std.testing.allocator, "1337");

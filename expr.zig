@@ -42,6 +42,7 @@ pub const Expr = union(enum) {
     gen: *const Expr,
     yield: *const Expr,
     yield_all: *const Expr,
+    @"return": *const Expr,
 
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -51,7 +52,7 @@ pub const Expr = union(enum) {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all => |value| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all, .@"return" => |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
             },
@@ -74,7 +75,7 @@ pub const Expr = union(enum) {
                 }
                 return @unionInit(Expr, @tagName(tag), copies);
             },
-            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all => |value, tag| {
+            inline .lambda, .call, .pow, .pos, .neg, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .not, .@"and", .@"or", .match, .@"if", .@"for", .gen, .yield, .yield_all, .@"return" => |value, tag| {
                 const copy = try allocator.create(@TypeOf(value.*));
                 errdefer allocator.destroy(copy);
                 copy.* = try value.clone(allocator);

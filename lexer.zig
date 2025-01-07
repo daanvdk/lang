@@ -6,6 +6,7 @@ pub const Lexer = struct {
     content: []const u8,
     index: usize = 0,
     next_token: ?Token = null,
+    internal: bool = false,
 
     pub fn init(content: []const u8) Lexer {
         return .{ .content = content };
@@ -48,7 +49,12 @@ pub const Lexer = struct {
     fn nextKnownType(self: *Lexer) ?Token.Type {
         const char0 = self.nextChar() orelse return .eof;
         switch (char0) {
-            'A'...'Z', 'a'...'z', '_' => {
+            'A'...'Z', 'a'...'z', '_', '@' => {
+                if (char0 == '@' and !self.internal) {
+                    self.pushChar(char0);
+                    return null;
+                }
+
                 const start = self.index - 1;
                 while (self.nextChar()) |char1| {
                     switch (char1) {
@@ -304,5 +310,6 @@ pub const Lexer = struct {
         .@"for" = .{"for"},
         .in = .{"in"},
         .yield = .{"yield"},
+        .@"return" = .{"return"},
     };
 };
