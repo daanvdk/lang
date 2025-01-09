@@ -50,6 +50,17 @@ pub const Pattern = union(enum) {
         }
     }
 
+    pub fn usesName(self: Pattern, name: []const u8) ?bool {
+        return switch (self) {
+            .name => |name_| if (std.mem.eql(u8, name_, name)) false else null,
+            .ignore => null,
+            .expr => |expr| if (expr.usesName(name)) true else null,
+            inline .list, .lists, .dict, .dicts => |items| for (items) |item| {
+                if (item.usesName(name)) |uses| break uses;
+            } else null,
+        };
+    }
+
     pub const Pair = struct {
         key: Expr,
         value: Pattern,
@@ -65,6 +76,11 @@ pub const Pattern = union(enum) {
             errdefer copy.key.deinit(allocator);
             copy.value = try self.value.clone(allocator);
             return copy;
+        }
+
+        pub fn usesName(self: Pair, name: []const u8) ?bool {
+            if (self.key.usesName(name)) return true;
+            return self.value.usesName(name);
         }
     };
 };

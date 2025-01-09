@@ -7,12 +7,6 @@ const internal_parse = @import("parser.zig").internal_parse;
 const Buffer = @import("compiler.zig").Buffer;
 const Compiler = @import("compiler.zig").Compiler;
 
-pub fn run(allocator: std.mem.Allocator, program: Program) Runner.Error!void {
-    var runner = try Runner.init(allocator);
-    defer runner.deinit();
-    _ = try runner.runProgram(program);
-}
-
 const stdlib = .{
     .send = (
         \\|iter, value| do
@@ -167,7 +161,7 @@ pub const Runner = struct {
 
     pub const Error = std.mem.Allocator.Error || error{RunError};
 
-    fn init(allocator: std.mem.Allocator) Runner.Error!Runner {
+    pub fn init(allocator: std.mem.Allocator) Runner.Error!Runner {
         var offsets: StdlibOffsets = undefined;
         const base_program = program: {
             var buffer = Buffer.init(allocator);
@@ -223,7 +217,7 @@ pub const Runner = struct {
         return self;
     }
 
-    fn deinit(self: *Runner) void {
+    pub fn deinit(self: *Runner) void {
         self.calls.deinit(self.allocator);
 
         while (self.last) |obj| {
@@ -306,7 +300,7 @@ pub const Runner = struct {
         return Value.Cons.toValue(try self.createList(items));
     }
 
-    fn runProgram(self: *Runner, program: Program) Error!Value {
+    pub fn runProgram(self: *Runner, program: Program) Error!Value {
         const program_ = self.create(.program, .{ .instrs = program.instrs, .data = program.data }) catch |err| {
             program.deinit(self.allocator);
             return err;
@@ -316,7 +310,7 @@ pub const Runner = struct {
         return try self.run(&call);
     }
 
-    fn run(self: *Runner, call: *Call) Error!Value {
+    pub fn run(self: *Runner, call: *Call) Error!Value {
         try self.calls.append(self.allocator, call);
         defer _ = self.calls.pop();
 
@@ -588,18 +582,18 @@ pub const Runner = struct {
         self.checkGc();
     }
 
-    fn expectNum(value: Value) !f64 {
+    pub fn expectNum(value: Value) !f64 {
         return switch (value) {
             .num => |num| num,
             else => error.RunError,
         };
     }
 
-    fn expectStr(value: *const Value) ![]const u8 {
+    pub fn expectStr(value: *const Value) ![]const u8 {
         return value.toStr() orelse error.RunError;
     }
 
-    fn expectCons(value: Value) !*Value.Cons {
+    pub fn expectCons(value: Value) !*Value.Cons {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
@@ -609,7 +603,7 @@ pub const Runner = struct {
         };
     }
 
-    fn expectDict(value: Value) !*Value.Dict {
+    pub fn expectDict(value: Value) !*Value.Dict {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .dict => @fieldParentPtr("obj", obj),
@@ -619,7 +613,7 @@ pub const Runner = struct {
         };
     }
 
-    fn expectLambda(value: Value) !*Value.Lambda {
+    pub fn expectLambda(value: Value) !*Value.Lambda {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .lambda => @fieldParentPtr("obj", obj),
@@ -629,7 +623,7 @@ pub const Runner = struct {
         };
     }
 
-    fn expectList(value: Value) !?*Value.Cons {
+    pub fn expectList(value: Value) !?*Value.Cons {
         return switch (value) {
             .nil => null,
             .obj => |obj| switch (obj.type) {
@@ -640,7 +634,7 @@ pub const Runner = struct {
         };
     }
 
-    fn expectCallable(value: Value) !Callable {
+    pub fn expectCallable(value: Value) !Callable {
         return switch (value) {
             .builtin => |builtin| .{ .builtin = builtin },
             .obj => |obj| switch (obj.type) {
@@ -656,7 +650,7 @@ pub const Runner = struct {
         lambda: *Value.Lambda,
     };
 
-    const Call = struct {
+    pub const Call = struct {
         program: *Value.Program,
         offset: usize,
         stack: std.ArrayListUnmanaged(Value) = .{},
@@ -825,7 +819,10 @@ pub const Runner = struct {
             var tail: Value = undefined;
             if (dict.next(key)) |item| {
                 head = item.obj.toValue();
-                tail = try self.runGlobal("@dict_tail", &.{ dict.obj.toValue(), item.head });
+                tail = try self.runLambda(
+                    self.stdlib_values.@"@dict_tail",
+                    &.{ dict.obj.toValue(), item.head },
+                );
             } else {
                 head = .null;
                 tail = .null;
@@ -852,13 +849,13 @@ pub const Runner = struct {
     }
 
     fn next(self: *Runner, iter: Value) Error!?[2]Value {
-        const result = try self.runGlobal("next", &.{iter});
+        const result = try self.runLambda(self.stdlib_values.next, &.{iter});
         if (result == .null) return null;
         return try Value.Cons.expectN(try expectList(result), 2);
     }
 
-    fn runGlobal(self: *Runner, comptime field: []const u8, args: []const Value) Error!Value {
-        const lambda = try expectLambda(@field(self.stdlib_values, field));
+    pub fn runLambda(self: *Runner, value: Value, args: []const Value) Error!Value {
+        const lambda = try expectLambda(value);
         var call = Call{
             .program = lambda.program,
             .offset = lambda.offset,

@@ -1,6 +1,12 @@
-d = {"foo" = 1, "bar" = 2, "baz" = 3}
-print(d.foo)
-print(d["bar"])
-print("baz" in d)
-print("qux" in d)
-print(len(d))
+pub A = 0
+pub B = 1
+
+pub fn fib(*args) match args do
+	[0, a, _] = a
+	[n, a, b] = fib(n - 1, b, a + b)
+	[n]       = fib(n, A, B)
+end
+
+pub fn main() do
+	print(fib(10))
+end

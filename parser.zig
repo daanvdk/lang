@@ -7,8 +7,7 @@ const Pattern = @import("pattern.zig").Pattern;
 
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) Parser.Error!Expr {
     var parser = Parser.init(allocator, content);
-    const body = try parser.parseBody(&.{.eof});
-    return body.expr;
+    return try parser.parseModule();
 }
 
 pub fn internal_parse(allocator: std.mem.Allocator, content: []const u8) Parser.Error!Expr {
@@ -34,6 +33,77 @@ const Parser = struct {
             .allocator = allocator,
             .lexer = Lexer.init(content),
         };
+    }
+
+    fn parseModule(self: *Parser) Error!Expr {
+        var fn_names = std.StringHashMap(void).init(self.allocator);
+        defer fn_names.deinit();
+
+        var stmts = std.ArrayList(Expr.Stmt).init(self.allocator);
+        defer {
+            for (stmts.items) |stmt| stmt.deinit(self.allocator);
+            stmts.deinit();
+        }
+
+        const old_skip = self.skip_newlines;
+        defer self.skip_newlines = old_skip;
+        self.skip_newlines = false;
+
+        while (true) {
+            while (self.skip(&.{.newline}) != null) {}
+            if (self.skip(&.{.eof}) != null) break;
+
+            var stmt: Expr.Stmt = undefined;
+            stmt.is_pub = self.skip(&.{.@"pub"}) != null;
+
+            if (self.skip(&.{.@"fn"}) != null) {
+                const token = try self.expect(&.{.name});
+                const result = try fn_names.getOrPut(token.content);
+
+                if (result.found_existing) {
+                    const pos = self.lexer.getPos(token);
+                    std.debug.print("{}:{}: duplicate fn name {s}\n", .{ pos.line, pos.column, token.content });
+                    return error.ParseError;
+                }
+
+                stmt.fn_name = token.content;
+                stmt.pattern = try self.parseCol(.list, .pattern, .lpar, .rpar);
+                errdefer stmt.pattern.deinit(self.allocator);
+                stmt.subject = try self.parseExpr(.expr);
+            } else if (stmt.is_pub) {
+                stmt.fn_name = null;
+                stmt.pattern = try self.parseExpr(.pattern);
+                errdefer stmt.pattern.deinit(self.allocator);
+                _ = try self.expect(&.{.assign});
+                stmt.subject = try self.parseExpr(.expr);
+            } else {
+                stmt.fn_name = null;
+                const result = try self.parseExpr(.both);
+                const assign = switch (result) {
+                    .expr => false,
+                    .pattern => assign: {
+                        errdefer result.deinit(self.allocator);
+                        _ = try self.expect(&.{.assign});
+                        break :assign true;
+                    },
+                    .both => self.skip(&.{.assign}) != null,
+                };
+                if (assign) {
+                    stmt.pattern = ParseType.both.toPattern(self.allocator, result);
+                    errdefer stmt.pattern.deinit(self.allocator);
+                    stmt.subject = try self.parseExpr(.expr);
+                } else {
+                    stmt.pattern = .ignore;
+                    stmt.subject = ParseType.both.toExpr(self.allocator, result);
+                }
+            }
+
+            errdefer stmt.deinit(self.allocator);
+            if (!self.peek(&.{.eof})) _ = try self.expect(&.{.newline});
+            try stmts.append(stmt);
+        }
+
+        return .{ .module = try stmts.toOwnedSlice() };
     }
 
     fn parseBody(self: *Parser, ends: []const Token.Type) Error!Body {
@@ -1127,37 +1197,37 @@ const IfBranch = struct {
 };
 
 test "parse num 1" {
-    const expr = try parse(std.testing.allocator, "1337");
+    const expr = try internal_parse(std.testing.allocator, "1337");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .num = 1337 }, expr);
 }
 
 test "parse num 2" {
-    const expr = try parse(std.testing.allocator, "45.67");
+    const expr = try internal_parse(std.testing.allocator, "45.67");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .num = 45.67 }, expr);
 }
 
 test "parse bool 1" {
-    const expr = try parse(std.testing.allocator, "true");
+    const expr = try internal_parse(std.testing.allocator, "true");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .bool = true }, expr);
 }
 
 test "parse bool 2" {
-    const expr = try parse(std.testing.allocator, "false");
+    const expr = try internal_parse(std.testing.allocator, "false");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .bool = false }, expr);
 }
 
 test "parse null" {
-    const expr = try parse(std.testing.allocator, "null");
+    const expr = try internal_parse(std.testing.allocator, "null");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr.null, expr);
 }
 
 test "parse operators" {
-    const expr = try parse(std.testing.allocator, "1 * 2 + 3 / -4");
+    const expr = try internal_parse(std.testing.allocator, "1 * 2 + 3 / -4");
     defer expr.deinit(std.testing.allocator);
     try std.testing.expectEqualDeep(Expr{ .add = &.{
         .lhs = .{ .mul = &.{
@@ -1172,7 +1242,7 @@ test "parse operators" {
 }
 
 test "parse var" {
-    const expr = try parse(std.testing.allocator, (
+    const expr = try internal_parse(std.testing.allocator, (
         \\x = 4
         \\x * x
     ));
@@ -1190,7 +1260,7 @@ test "parse var" {
 }
 
 test "parse lambda" {
-    const expr = try parse(std.testing.allocator, (
+    const expr = try internal_parse(std.testing.allocator, (
         \\sqr = |x| x * x
         \\sqr(4)
     ));
@@ -1218,7 +1288,7 @@ test "parse lambda" {
 }
 
 test "parse closure" {
-    const expr = try parse(std.testing.allocator, (
+    const expr = try internal_parse(std.testing.allocator, (
         \\n = 2
         \\times_n = |x| x * n
         \\times_n(4)
@@ -1253,7 +1323,7 @@ test "parse closure" {
 }
 
 test "parse dict" {
-    const expr = try parse(std.testing.allocator, (
+    const expr = try internal_parse(std.testing.allocator, (
         \\{"foo" = foo, *_} = {"foo" = 1, "bar" = 2, "baz" = 3}
         \\foo
     ));
@@ -1273,5 +1343,86 @@ test "parse dict" {
             } },
             .expr = .{ .name = "foo" },
         }},
+    } }, expr);
+}
+
+test "parse module" {
+    const expr = try parse(std.testing.allocator, (
+        \\A = 0
+        \\B = 1
+        \\pub fn fib(*args) match args do
+        \\  [0, a, _] = a
+        \\  [n, a, b] = fib(n - 1, b, a + b)
+        \\  [n]       = fib(n, A, B) 
+        \\end
+    ));
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .module = &.{
+        .{
+            .fn_name = null,
+            .is_pub = false,
+            .pattern = .{ .name = "A" },
+            .subject = .{ .num = 0 },
+        },
+        .{
+            .fn_name = null,
+            .is_pub = false,
+            .pattern = .{ .name = "B" },
+            .subject = .{ .num = 1 },
+        },
+        .{
+            .fn_name = "fib",
+            .is_pub = true,
+            .pattern = .{ .lists = &.{
+                .{ .name = "args" },
+            } },
+            .subject = .{ .match = &.{
+                .subject = .{ .name = "args" },
+                .matchers = &.{
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .expr = &.{ .num = 0 } },
+                            .{ .name = "a" },
+                            .ignore,
+                        } },
+                        .expr = .{ .name = "a" },
+                    },
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .name = "n" },
+                            .{ .name = "a" },
+                            .{ .name = "b" },
+                        } },
+                        .expr = .{ .call = &.{
+                            .lhs = .{ .name = "fib" },
+                            .rhs = .{ .list = &.{
+                                .{ .sub = &.{
+                                    .lhs = .{ .name = "n" },
+                                    .rhs = .{ .num = 1 },
+                                } },
+                                .{ .name = "b" },
+                                .{ .add = &.{
+                                    .lhs = .{ .name = "a" },
+                                    .rhs = .{ .name = "b" },
+                                } },
+                            } },
+                        } },
+                    },
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .name = "n" },
+                        } },
+                        .expr = .{ .call = &.{
+                            .lhs = .{ .name = "fib" },
+                            .rhs = .{ .list = &.{
+                                .{ .name = "n" },
+                                .{ .name = "A" },
+                                .{ .name = "B" },
+                            } },
+                        } },
+                    },
+                },
+            } },
+        },
     } }, expr);
 }

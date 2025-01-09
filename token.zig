@@ -52,6 +52,9 @@ pub const Token = struct {
         yield,
         @"return",
 
+        @"pub",
+        @"fn",
+
         space,
         comment,
         newline,

@@ -531,6 +531,212 @@ pub const Compiler = struct {
                 _ = try self.compileExpr(expr_ptr.*, .returned);
                 return .all;
             },
+            .module => |stmts| {
+                const allocator = self.instrs.allocator;
+
+                // Collect what fns we have
+                var fn_keys = std.StringHashMap([]const u8).init(allocator);
+                defer {
+                    var iter = fn_keys.valueIterator();
+                    while (iter.next()) |fn_key| allocator.free(fn_key.*);
+                    fn_keys.deinit();
+                }
+
+                for (stmts) |stmt| {
+                    const fn_name = stmt.fn_name orelse continue;
+                    const fn_key = try allocator.alloc(u8, fn_name.len + 1);
+                    fn_key[0] = '@';
+                    @memcpy(fn_key[1..], fn_name);
+                    errdefer allocator.free(fn_key);
+                    try fn_keys.put(fn_name, fn_key);
+                }
+
+                // Compile statements
+                const start = self.stack.size();
+
+                var mod_exprs = std.ArrayList(ModExpr).init(allocator);
+                var mod_expr_indexes = std.StringHashMap(usize).init(allocator);
+                defer {
+                    for (mod_exprs.items) |mod_expr| mod_expr.expr.deinit(allocator);
+                    mod_exprs.deinit();
+                    mod_expr_indexes.deinit();
+                }
+
+                var pub_exprs = std.ArrayList(PubExpr).init(allocator);
+                var pub_expr_indexes = std.StringHashMap(usize).init(allocator);
+                defer {
+                    pub_exprs.deinit();
+                    pub_expr_indexes.deinit();
+                }
+
+                try self.instrs.append(.empty_dict);
+                try self.stack.push(.{ .name = "@module", .info = .dict });
+
+                var fn_index = self.instrs.items.len;
+
+                for (stmts) |stmt| {
+                    const offset = self.stack.size() - 1;
+
+                    if (stmt.fn_name) |fn_name| {
+                        try self.putMod(&mod_exprs, &mod_expr_indexes, fn_name, .{ .call = &.{
+                            .lhs = .{ .get = &.{
+                                .lhs = .{ .name = "@module" },
+                                .rhs = .{ .str = fn_keys.get(fn_name).? },
+                            } },
+                            .rhs = .{ .list = &.{
+                                .{ .name = "@module" },
+                            } },
+                        } });
+                        if (stmt.is_pub) try putPub(&pub_exprs, &pub_expr_indexes, fn_name, null);
+                    } else {
+                        const info = try self.compileExpr(stmt.subject, .used);
+                        try self.compilePattern(stmt.pattern, info, null, offset + 1);
+
+                        if (offset < self.stack.size() - 1) {
+                            try self.instrs.append(.{ .local = offset });
+                            try self.instrs.append(.{ .pop = offset });
+                            const entry = self.stack.entries.orderedRemove(offset);
+                            try self.stack.push(entry);
+                        }
+
+                        for (offset.., self.stack.entries.items[offset .. self.stack.size() - 1]) |index, maybe_entry| {
+                            const entry = maybe_entry orelse continue;
+
+                            _ = try self.compileExpr(.{ .str = entry.name }, .used);
+                            try self.instrs.append(.{ .local = index });
+                            try self.instrs.append(.put_dict);
+
+                            try self.putMod(&mod_exprs, &mod_expr_indexes, entry.name, .{ .get = &.{
+                                .lhs = .{ .name = "@module" },
+                                .rhs = .{ .str = entry.name },
+                            } });
+                            if (stmt.is_pub) try putPub(&pub_exprs, &pub_expr_indexes, entry.name, index);
+                        }
+                    }
+                }
+
+                // Create the pub dict
+                try self.instrs.append(.empty_dict);
+                try self.stack.push(null);
+                for (pub_exprs.items) |pub_expr| {
+                    _ = try self.compileExpr(.{ .str = pub_expr.name }, .used);
+                    if (pub_expr.index) |local| {
+                        try self.instrs.append(.{ .local = local });
+                    } else {
+                        try self.stack.push(null);
+                        _ = try self.compileExpr(.{ .call = &.{
+                            .lhs = .{ .get = &.{
+                                .lhs = .{ .name = "@module" },
+                                .rhs = .{ .str = fn_keys.get(pub_expr.name).? },
+                            } },
+                            .rhs = .{ .list = &.{
+                                .{ .name = "@module" },
+                            } },
+                        } }, .used);
+                        self.stack.pop();
+                    }
+                    try self.instrs.append(.put_dict);
+                }
+                self.stack.pop();
+
+                while (self.stack.size() > start) {
+                    self.stack.pop();
+                    if (usage != .returned) try self.instrs.append(.{ .pop = self.stack.size() });
+                }
+
+                // Compile fns
+                for (stmts) |stmt| {
+                    const fn_name = stmt.fn_name orelse continue;
+                    const fn_key = fn_keys.get(fn_name).?;
+
+                    var body = try (Expr{ .match = &.{
+                        .subject = .{ .name = "@args" },
+                        .matchers = &.{.{
+                            .pattern = stmt.pattern,
+                            .expr = stmt.subject,
+                        }},
+                    } }).clone(allocator);
+                    defer body.deinit(allocator);
+
+                    // Wrap with all things used from the module
+                    var i = mod_exprs.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const entry = mod_exprs.items[i];
+                        if (!body.usesName(entry.name)) continue;
+
+                        const matchers = try allocator.alloc(Expr.Matcher, 1);
+                        errdefer allocator.free(matchers);
+                        matchers[0] = .{ .pattern = .{ .name = entry.name }, .expr = body };
+
+                        const match = try allocator.create(Expr.Match);
+                        errdefer allocator.destroy(match);
+                        match.subject = try entry.expr.clone(allocator);
+                        match.matchers = matchers;
+
+                        body = .{ .match = match };
+                    }
+
+                    // Compile fn
+                    const fn_start = self.instrs.items.len;
+                    try self.stack.push(.{ .name = "@module", .info = .dict });
+                    _ = try self.compileExpr(.{ .str = fn_key }, .used);
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(.{ .lambda = &.{
+                        .pattern = .{ .list = &.{
+                            .{ .name = "@module" },
+                        } },
+                        .expr = .{ .lambda = &.{
+                            .pattern = .{ .name = "@args" },
+                            .expr = body,
+                        } },
+                    } }, .used);
+                    self.stack.pop();
+                    self.stack.pop();
+                    try self.instrs.append(.put_dict);
+
+                    // Move fn to the front
+                    const fn_len = self.instrs.items.len - fn_start;
+                    try self.moveInstrs(fn_start, fn_index, fn_len);
+                    fn_index += fn_len;
+                }
+
+                try self.compileUsage(usage);
+                return .dict;
+            },
+        }
+    }
+
+    fn putMod(
+        self: *Compiler,
+        mod_exprs: *std.ArrayList(ModExpr),
+        mod_expr_indexes: *std.StringHashMap(usize),
+        name: []const u8,
+        expr: Expr,
+    ) !void {
+        const allocator = self.instrs.allocator;
+        const mod_expr = try expr.clone(allocator);
+        if (mod_expr_indexes.get(name)) |i| {
+            mod_exprs.items[i].expr.deinit(allocator);
+            mod_exprs.items[i].expr = mod_expr;
+        } else {
+            errdefer mod_expr.deinit(self.instrs.allocator);
+            try mod_expr_indexes.put(name, mod_exprs.items.len);
+            try mod_exprs.append(.{ .name = name, .expr = mod_expr });
+        }
+    }
+
+    fn putPub(
+        pub_exprs: *std.ArrayList(PubExpr),
+        pub_expr_indexes: *std.StringHashMap(usize),
+        name: []const u8,
+        index: ?usize,
+    ) !void {
+        if (pub_expr_indexes.get(name)) |i| {
+            pub_exprs.items[i].index = index;
+        } else {
+            try pub_expr_indexes.put(name, pub_exprs.items.len);
+            try pub_exprs.append(.{ .name = name, .index = index });
         }
     }
 
@@ -736,6 +942,66 @@ pub const Compiler = struct {
             cap.index += 1;
         }
     }
+
+    fn moveInstrs(self: *Compiler, old_index: usize, new_index: usize, len: usize) !void {
+        const caps_old_index = self.findCaps(old_index);
+        const caps_new_index = self.findCaps(new_index);
+        const caps_len = self.findCaps(old_index + len) - caps_old_index;
+
+        try moveSlice(Instr, self.instrs, old_index, new_index, len);
+        try moveSlice(Cap, self.caps, caps_old_index, caps_new_index, caps_len);
+
+        if (caps_old_index < caps_new_index) {
+            for (self.caps.items[caps_old_index..caps_new_index]) |*cap| {
+                cap.index -= len;
+            }
+        } else {
+            for (self.caps.items[caps_new_index + caps_len .. caps_old_index + caps_len]) |*cap| {
+                cap.index += len;
+            }
+        }
+        for (self.caps.items[caps_new_index .. caps_new_index + caps_len]) |*cap| {
+            cap.index += new_index - old_index;
+        }
+    }
+
+    fn findCaps(self: *Compiler, instr_index: usize) usize {
+        var min_index: usize = 0;
+        var max_index = self.caps.items.len;
+
+        while (min_index != max_index) {
+            const mid_index = (min_index + max_index) / 2;
+            if (instr_index <= self.caps.items[mid_index].index) {
+                max_index = mid_index;
+            } else {
+                min_index = mid_index + 1;
+            }
+        }
+
+        return min_index;
+    }
+
+    fn moveSlice(comptime T: type, list: std.ArrayList(T), old_index: usize, new_index: usize, len: usize) !void {
+        if (old_index == new_index or len == 0) return;
+
+        const data = try list.allocator.dupe(T, list.items[old_index .. old_index + len]);
+        defer list.allocator.free(data);
+
+        if (old_index < new_index) {
+            std.mem.copyForwards(
+                T,
+                list.items[old_index..new_index],
+                list.items[old_index + len .. new_index + len],
+            );
+        } else {
+            std.mem.copyBackwards(
+                T,
+                list.items[new_index + len .. old_index + len],
+                list.items[new_index..old_index],
+            );
+        }
+        @memcpy(list.items[new_index .. new_index + len], data);
+    }
 };
 
 const Usage = union(enum) { returned, used, ignored };
@@ -816,6 +1082,16 @@ const Stack = struct {
 const Cap = struct {
     index: usize,
     name: []const u8,
+};
+
+const ModExpr = struct {
+    name: []const u8,
+    expr: Expr,
+};
+
+const PubExpr = struct {
+    name: []const u8,
+    index: ?usize,
 };
 
 test "compile num 1" {
@@ -1057,6 +1333,242 @@ test "compile dict" {
         .pop_dict,
         .{ .pop = 1 },
         .{ .local = 0 },
+        .ret,
+    }, program.instrs);
+}
+
+test "compile module" {
+    const program = try compile(std.testing.allocator, .{ .module = &.{
+        .{
+            .fn_name = null,
+            .is_pub = false,
+            .pattern = .{ .name = "A" },
+            .subject = .{ .num = 0 },
+        },
+        .{
+            .fn_name = null,
+            .is_pub = false,
+            .pattern = .{ .name = "B" },
+            .subject = .{ .num = 1 },
+        },
+        .{
+            .fn_name = "fib",
+            .is_pub = true,
+            .pattern = .{ .lists = &.{
+                .{ .name = "args" },
+            } },
+            .subject = .{ .match = &.{
+                .subject = .{ .name = "args" },
+                .matchers = &.{
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .expr = &.{ .num = 0 } },
+                            .{ .name = "a" },
+                            .ignore,
+                        } },
+                        .expr = .{ .name = "a" },
+                    },
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .name = "n" },
+                            .{ .name = "a" },
+                            .{ .name = "b" },
+                        } },
+                        .expr = .{ .call = &.{
+                            .lhs = .{ .name = "fib" },
+                            .rhs = .{ .list = &.{
+                                .{ .sub = &.{
+                                    .lhs = .{ .name = "n" },
+                                    .rhs = .{ .num = 1 },
+                                } },
+                                .{ .name = "b" },
+                                .{ .add = &.{
+                                    .lhs = .{ .name = "a" },
+                                    .rhs = .{ .name = "b" },
+                                } },
+                            } },
+                        } },
+                    },
+                    .{
+                        .pattern = .{ .list = &.{
+                            .{ .name = "n" },
+                        } },
+                        .expr = .{ .call = &.{
+                            .lhs = .{ .name = "fib" },
+                            .rhs = .{ .list = &.{
+                                .{ .name = "n" },
+                                .{ .name = "A" },
+                                .{ .name = "B" },
+                            } },
+                        } },
+                    },
+                },
+            } },
+        },
+    } });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .empty_dict,
+        // @fib
+        .{ .short_str = Value.toShort("@fib").? },
+        .{ .lambda = .{ .caps = 0, .len = 114 } },
+        .{ .local = 0 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 0 },
+        .no_match,
+        .decons,
+        .{ .jmp_if = 1 },
+        .{ .jmp = 2 },
+        .{ .pop = 0 },
+        .no_match,
+        .{ .local = 0 },
+        .{ .lambda = .{ .caps = 1, .len = 102 } },
+        // A
+        .{ .local = 0 },
+        .{ .short_str = Value.toShort("A").? },
+        .get,
+        // B
+        .{ .local = 0 },
+        .{ .short_str = Value.toShort("B").? },
+        .get,
+        // fib
+        .{ .local = 0 },
+        .{ .short_str = Value.toShort("@fib").? },
+        .get,
+        .{ .local = 0 },
+        .nil,
+        .cons,
+        .call,
+        .{ .local = 1 },
+        // start match
+        .{ .local = 5 },
+        // [0, a, _]
+        .{ .local = 6 },
+        .{ .local = 7 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 7 },
+        .{ .jmp = 26 },
+        .decons,
+        .{ .local = 7 },
+        .{ .pop = 7 },
+        .{ .num = 0 },
+        .eq,
+        .{ .jmp_if = 2 },
+        .{ .pop = 7 },
+        .{ .jmp = 18 },
+        .{ .local = 7 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 7 },
+        .{ .jmp = 14 },
+        .decons,
+        .{ .local = 8 },
+        .{ .jmp_if = 3 },
+        .{ .pop = 8 },
+        .{ .pop = 7 },
+        .{ .jmp = 8 },
+        .decons,
+        .{ .pop = 8 },
+        .{ .jmp_if = 1 },
+        .{ .jmp = 2 },
+        .{ .pop = 7 },
+        .{ .jmp = 2 },
+        .{ .local = 7 },
+        .ret,
+        // [n, a, b]
+        .{ .local = 6 },
+        .{ .local = 7 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 7 },
+        .{ .jmp = 33 },
+        .decons,
+        .{ .local = 8 },
+        .{ .jmp_if = 3 },
+        .{ .pop = 8 },
+        .{ .pop = 7 },
+        .{ .jmp = 27 },
+        .decons,
+        .{ .local = 9 },
+        .{ .jmp_if = 4 },
+        .{ .pop = 9 },
+        .{ .pop = 8 },
+        .{ .pop = 7 },
+        .{ .jmp = 20 },
+        .decons,
+        .{ .jmp_if = 1 },
+        .{ .jmp = 4 },
+        .{ .pop = 9 },
+        .{ .pop = 8 },
+        .{ .pop = 7 },
+        .{ .jmp = 13 },
+        // @module @args A B fib args subject n a b
+        .{ .local = 4 },
+        .{ .local = 7 },
+        .{ .num = 1 },
+        .sub,
+        .{ .local = 9 },
+        .{ .local = 8 },
+        .{ .local = 9 },
+        .add,
+        .nil,
+        .cons,
+        .cons,
+        .cons,
+        .tail_call,
+        // [n]
+        .{ .local = 6 },
+        .{ .jmp_if = 2 },
+        .{ .pop = 6 },
+        .no_match,
+        .decons,
+        .{ .jmp_if = 1 },
+        .{ .jmp = 2 },
+        .{ .pop = 6 },
+        .no_match,
+        .{ .local = 4 },
+        .{ .local = 6 },
+        .{ .local = 2 },
+        .{ .local = 3 },
+        .nil,
+        .cons,
+        .cons,
+        .cons,
+        .tail_call,
+        // end match
+        .ret,
+        .put_dict,
+
+        // A
+        .{ .num = 0 },
+
+        .{ .local = 0 },
+        .{ .pop = 0 },
+        .{ .short_str = Value.toShort("A").? },
+        .{ .local = 0 },
+        .put_dict,
+
+        // B
+        .{ .num = 1 },
+
+        .{ .local = 1 },
+        .{ .pop = 1 },
+        .{ .short_str = Value.toShort("B").? },
+        .{ .local = 1 },
+        .put_dict,
+
+        // pub
+        .empty_dict,
+
+        .{ .short_str = Value.toShort("fib").? },
+        .{ .local = 2 },
+        .{ .short_str = Value.toShort("@fib").? },
+        .get,
+        .{ .local = 2 },
+        .nil,
+        .cons,
+        .call,
+        .put_dict,
+
         .ret,
     }, program.instrs);
 }

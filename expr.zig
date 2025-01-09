@@ -48,11 +48,13 @@ pub const Expr = union(enum) {
     yield_all: *const Expr,
     @"return": *const Expr,
 
+    module: []const Stmt,
+
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
         switch (self) {
             .global, .name, .num, .bool, .null => {},
             .str => |content| allocator.free(content),
-            inline .list, .lists, .dict, .dicts => |items| {
+            inline .list, .lists, .dict, .dicts, .module => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
@@ -67,7 +69,7 @@ pub const Expr = union(enum) {
         switch (self) {
             .global, .name, .num, .bool, .null => return self,
             .str => |content| return .{ .str = try allocator.dupe(u8, content) },
-            inline .list, .lists, .dict, .dicts => |items, tag| {
+            inline .list, .lists, .dict, .dicts, .module => |items, tag| {
                 const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
                 errdefer {
@@ -88,6 +90,43 @@ pub const Expr = union(enum) {
         }
     }
 
+    pub fn usesName(self: Expr, name: []const u8) bool {
+        return switch (self) {
+            .global, .num, .bool, .null, .str => false,
+            .name => |name_| std.mem.eql(u8, name_, name),
+            inline .list, .lists, .dict, .dicts => |items| for (items) |item| {
+                if (item.usesName(name)) break true;
+            } else false,
+            .module => |stmts| uses: {
+                const is_in_module = for (stmts) |stmt| {
+                    if (stmt.fn_name) |fn_name| {
+                        if (std.mem.eql(u8, name, fn_name)) break true;
+                    } else {
+                        if (!(stmt.pattern.usesName(name) orelse true)) break true;
+                    }
+                } else false;
+
+                if (!is_in_module) {
+                    for (stmts) |stmt| {
+                        if (stmt.fn_name != null and (stmt.pattern.usesName(name) orelse stmt.subject.usesName(name))) break :uses true;
+                    }
+                }
+
+                for (stmts) |stmt| {
+                    if (stmt.fn_name) |fn_name| {
+                        if (std.mem.eql(u8, name, fn_name)) break :uses false;
+                    } else {
+                        if (stmt.subject.usesName(name)) break :uses true;
+                        if (stmt.pattern.usesName(name)) |uses| break :uses uses;
+                    }
+                }
+
+                break :uses false;
+            },
+            inline else => |value| value.usesName(name),
+        };
+    }
+
     pub const Bin = struct {
         lhs: Expr,
         rhs: Expr,
@@ -103,6 +142,10 @@ pub const Expr = union(enum) {
             errdefer copy.lhs.deinit(allocator);
             copy.rhs = try self.rhs.clone(allocator);
             return copy;
+        }
+
+        pub fn usesName(self: Bin, name: []const u8) bool {
+            return self.lhs.usesName(name) or self.rhs.usesName(name);
         }
     };
 
@@ -132,6 +175,15 @@ pub const Expr = union(enum) {
 
             return .{ .subject = subject, .matchers = matchers };
         }
+
+        pub fn usesName(self: Match, name: []const u8) bool {
+            if (self.subject.usesName(name)) return true;
+            for (self.matchers) |matcher| {
+                if (matcher.usesName(name)) return true;
+                if (matcher.pattern == .ignore) break;
+            }
+            return false;
+        }
     };
 
     pub const Matcher = struct {
@@ -149,6 +201,10 @@ pub const Expr = union(enum) {
             errdefer copy.pattern.deinit(allocator);
             copy.expr = try self.expr.clone(allocator);
             return copy;
+        }
+
+        pub fn usesName(self: Matcher, name: []const u8) bool {
+            return self.pattern.usesName(name) orelse self.expr.usesName(name);
         }
     };
 
@@ -172,6 +228,10 @@ pub const Expr = union(enum) {
             copy.else_ = try self.else_.clone(allocator);
             return copy;
         }
+
+        pub fn usesName(self: If, name: []const u8) bool {
+            return self.cond.usesName(name) or self.then.usesName(name) or self.else_.usesName(name);
+        }
     };
 
     pub const For = struct {
@@ -190,6 +250,10 @@ pub const Expr = union(enum) {
             copy.matcher = try self.matcher.clone(allocator);
             return copy;
         }
+
+        pub fn usesName(self: For, name: []const u8) bool {
+            return self.subject.usesName(name) or self.matcher.usesName(name);
+        }
     };
 
     pub const Pair = struct {
@@ -206,6 +270,29 @@ pub const Expr = union(enum) {
             copy.key = try self.key.clone(allocator);
             errdefer copy.key.deinit(allocator);
             copy.value = try self.value.clone(allocator);
+            return copy;
+        }
+
+        pub fn usesName(self: Pair, name: []const u8) bool {
+            return self.key.usesName(name) or self.value.usesName(name);
+        }
+    };
+
+    pub const Stmt = struct {
+        fn_name: ?[]const u8,
+        pattern: Pattern,
+        subject: Expr,
+        is_pub: bool,
+
+        pub fn deinit(self: Stmt, allocator: std.mem.Allocator) void {
+            self.pattern.deinit(allocator);
+            self.subject.deinit(allocator);
+        }
+
+        pub fn clone(self: Stmt, allocator: std.mem.Allocator) std.mem.Allocator.Error!Stmt {
+            var copy: Stmt = self;
+            copy.pattern = try self.pattern.clone(allocator);
+            copy.subject = try self.subject.clone(allocator);
             return copy;
         }
     };
