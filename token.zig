@@ -20,6 +20,7 @@ pub const Token = struct {
         lpar,
         rpar,
         pipe,
+        dot,
 
         pow,
         mul,

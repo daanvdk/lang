@@ -275,7 +275,7 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .any;
             },
-            inline .call, .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge => |bin, tag| {
+            inline .call, .get, .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .in => |bin, tag| {
                 _ = try self.compileExpr(bin.lhs, .used);
                 try self.stack.push(null);
                 _ = try self.compileExpr(bin.rhs, .used);

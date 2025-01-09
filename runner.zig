@@ -98,6 +98,15 @@ const stdlib = .{
         \\  [stop] = count(0, stop, 1)
         \\end
     ),
+    .len = (
+        \\|*args| match args do
+        \\  [iter, acc] = do
+        \\    [_, tail] = next(iter) else return acc
+        \\    len(tail, acc + 1)
+        \\  end
+        \\  [iter] = len(iter, 0)
+        \\end
+    ),
     .@"@dict_tail" = (
         \\|dict, key| |_| @dict_send(dict, key)
     ),
@@ -436,6 +445,25 @@ pub const Runner = struct {
                             ip = call.program.instrs.ptr + call.offset;
                         },
                     }
+                },
+                .get => {
+                    const rhs = call.stack.pop();
+                    const lhs = call.stack.pop();
+                    try call.stack.append(self.allocator, switch (lhs) {
+                        .obj => |obj| switch (obj.type) {
+                            .cons => get: {
+                                var index: usize = @intFromFloat(try expectNum(rhs));
+                                var cons = Value.ObjType.cons.detailed(obj);
+                                while (index > 0) : (index -= 1) {
+                                    cons = cons.tail orelse return error.RunError;
+                                }
+                                break :get cons.head;
+                            },
+                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return error.RunError,
+                            else => return error.RunError,
+                        },
+                        else => return error.RunError,
+                    });
                 },
 
                 .pow => {

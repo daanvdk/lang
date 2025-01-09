@@ -168,7 +168,7 @@ const Parser = struct {
     fn parseCmp(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
         const result = try self.parseAdd(parse_type);
         if (!parse_type.isExpr(result)) return result;
-        const op = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge }) orelse return result;
+        const op = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge, .in }) orelse return result;
 
         const lhs = parse_type.toExpr(self.allocator, result);
         errdefer lhs.deinit(self.allocator);
@@ -179,7 +179,7 @@ const Parser = struct {
         const bin = try self.allocator.create(Expr.Bin);
         bin.* = .{ .lhs = lhs, .rhs = rhs };
         return parse_type.fromExpr(switch (op.type) {
-            inline .eq, .ne, .lt, .le, .gt, .ge => |tag| @unionInit(Expr, @tagName(tag), bin),
+            inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @unionInit(Expr, @tagName(tag), bin),
             else => unreachable,
         });
     }
@@ -243,7 +243,7 @@ const Parser = struct {
     }
 
     fn parsePow(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
-        const result = try self.parseCall(parse_type);
+        const result = try self.parseCall(parse_type, false);
         if (!parse_type.isExpr(result) or self.skip(&.{.pow}) == null) return result;
 
         const lhs = parse_type.toExpr(self.allocator, result);
@@ -257,14 +257,14 @@ const Parser = struct {
         return parse_type.fromExpr(.{ .pow = bin });
     }
 
-    fn parseCall(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+    fn parseCall(self: *Parser, comptime parse_type: ParseType, get_only: bool) Error!parse_type.Result() {
         const result = try self.parseLit(parse_type);
-        if (!parse_type.isExpr(result) or !self.peek(&.{ .lpar, .pipe })) return result;
+        if (!parse_type.isExpr(result) or !self.peek(if (get_only) &.{ .dot, .llist } else &.{ .lpar, .pipe, .dot, .llist })) return result;
 
         var lhs = parse_type.toExpr(self.allocator, result);
 
         while (true) {
-            if (self.peek(&.{.lpar})) {
+            if (!get_only and self.peek(&.{.lpar})) {
                 errdefer lhs.deinit(self.allocator);
                 const rhs = try self.parseCol(.list, .expr, .lpar, .rpar);
                 errdefer rhs.deinit(self.allocator);
@@ -272,14 +272,14 @@ const Parser = struct {
                 const bin = try self.allocator.create(Expr.Bin);
                 bin.* = .{ .lhs = lhs, .rhs = rhs };
                 lhs = .{ .call = bin };
-            } else if (self.skip(&.{.pipe}) != null) {
+            } else if (!get_only and self.skip(&.{.pipe}) != null) {
                 var owner = true;
                 errdefer if (owner) lhs.deinit(self.allocator);
 
                 const bin = try self.allocator.create(Expr.Bin);
                 errdefer self.allocator.destroy(bin);
 
-                bin.lhs = try self.parseLit(.expr);
+                bin.lhs = try self.parseCall(.expr, true);
                 errdefer bin.lhs.deinit(self.allocator);
 
                 _ = try self.expect(&.{.lpar});
@@ -293,6 +293,28 @@ const Parser = struct {
                 bin.rhs = try self.parseColTail(.list, .expr, &state, .rpar);
 
                 lhs = .{ .call = bin };
+            } else if (self.skip(&.{.dot}) != null) {
+                errdefer lhs.deinit(self.allocator);
+                const name = try self.expect(&.{.name});
+                const rhs = Expr{ .str = try self.allocator.dupe(u8, name.content) };
+                errdefer rhs.deinit(self.allocator);
+
+                const bin = try self.allocator.create(Expr.Bin);
+                bin.* = .{ .lhs = lhs, .rhs = rhs };
+                lhs = .{ .get = bin };
+            } else if (self.skip(&.{.llist}) != null) {
+                const old_skip = self.skip_newlines;
+                defer self.skip_newlines = old_skip;
+                self.skip_newlines = true;
+
+                errdefer lhs.deinit(self.allocator);
+                const rhs = try self.parseExpr(.expr);
+                errdefer rhs.deinit(self.allocator);
+                _ = try self.expect(&.{.rlist});
+
+                const bin = try self.allocator.create(Expr.Bin);
+                bin.* = .{ .lhs = lhs, .rhs = rhs };
+                lhs = .{ .get = bin };
             } else {
                 break;
             }

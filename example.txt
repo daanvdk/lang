@@ -1,1 +1,6 @@
-print({"foo" = 1, "bar" = 2, "baz" = 3})
+d = {"foo" = 1, "bar" = 2, "baz" = 3}
+print(d.foo)
+print(d["bar"])
+print("baz" in d)
+print("qux" in d)
+print(len(d))

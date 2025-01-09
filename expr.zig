@@ -18,6 +18,7 @@ pub const Expr = union(enum) {
     lambda: *const Matcher,
 
     call: *const Bin,
+    get: *const Bin,
 
     pow: *const Bin,
     pos: *const Expr,
@@ -33,6 +34,7 @@ pub const Expr = union(enum) {
     le: *const Bin,
     gt: *const Bin,
     ge: *const Bin,
+    in: *const Bin,
 
     not: *const Expr,
     @"and": *const Bin,

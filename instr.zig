@@ -26,6 +26,7 @@ pub const Instr = union(enum) {
 
     call,
     tail_call,
+    get,
 
     pow,
     pos,
@@ -73,6 +74,7 @@ pub const Instr = union(enum) {
         filter,
         reduce,
         count,
+        len,
 
         @"@str_send",
         @"@dict_send",
