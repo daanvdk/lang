@@ -13,6 +13,8 @@ pub const Expr = union(enum) {
 
     list: []const Expr,
     lists: []const Expr,
+    dict: []const Expr.Pair,
+    dicts: []const Expr,
     lambda: *const Matcher,
 
     call: *const Bin,
@@ -48,7 +50,7 @@ pub const Expr = union(enum) {
         switch (self) {
             .global, .name, .num, .bool, .null => {},
             .str => |content| allocator.free(content),
-            .list, .lists => |items| {
+            inline .list, .lists, .dict, .dicts => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
@@ -63,8 +65,8 @@ pub const Expr = union(enum) {
         switch (self) {
             .global, .name, .num, .bool, .null => return self,
             .str => |content| return .{ .str = try allocator.dupe(u8, content) },
-            inline .list, .lists => |items, tag| {
-                const copies = try allocator.alloc(Expr, items.len);
+            inline .list, .lists, .dict, .dicts => |items, tag| {
+                const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
                 errdefer {
                     allocator.free(copies);
@@ -184,6 +186,24 @@ pub const Expr = union(enum) {
             copy.subject = try self.subject.clone(allocator);
             errdefer copy.subject.deinit(allocator);
             copy.matcher = try self.matcher.clone(allocator);
+            return copy;
+        }
+    };
+
+    pub const Pair = struct {
+        key: Expr,
+        value: Expr,
+
+        pub fn deinit(self: Pair, allocator: std.mem.Allocator) void {
+            self.key.deinit(allocator);
+            self.value.deinit(allocator);
+        }
+
+        pub fn clone(self: Pair, allocator: std.mem.Allocator) std.mem.Allocator.Error!Pair {
+            var copy: Pair = undefined;
+            copy.key = try self.key.clone(allocator);
+            errdefer copy.key.deinit(allocator);
+            copy.value = try self.value.clone(allocator);
             return copy;
         }
     };

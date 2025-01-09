@@ -14,6 +14,11 @@ pub const Instr = union(enum) {
     nil,
     cons,
     decons,
+
+    empty_dict,
+    put_dict,
+    pop_dict,
+
     lambda: packed struct {
         caps: u32,
         len: u32,
@@ -36,6 +41,7 @@ pub const Instr = union(enum) {
     le,
     gt,
     ge,
+    in,
 
     not,
 
@@ -53,6 +59,7 @@ pub const Instr = union(enum) {
         is_null,
         is_str,
         is_list,
+        is_dict,
         is_func,
         str,
         join,
@@ -61,11 +68,14 @@ pub const Instr = union(enum) {
         next,
         send,
         list,
+        dict,
         map,
         filter,
         reduce,
         count,
 
         @"@str_send",
+        @"@dict_send",
+        @"@dict_tail",
     };
 };

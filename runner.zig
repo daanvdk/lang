@@ -24,6 +24,8 @@ const stdlib = .{
         \\    end
         \\  elif is_str(iter) do
         \\    @str_send(iter)
+        \\  elif is_dict(iter) do
+        \\    @dict_send(iter)
         \\  else
         \\    iter(value)
         \\  end
@@ -49,6 +51,18 @@ const stdlib = .{
         \\    [head, *tail]
         \\  else
         \\    list(*iters)
+        \\  end
+        \\end
+    ),
+    .dict = (
+        \\|*iters| do
+        \\  [{*target}, *iters] = iters else return dict({}, *iters)
+        \\  [iter, *iters] = iters else return target
+        \\  if [head, tail] = next(iter) do
+        \\    [key, value] = head
+        \\    dict({*target, key = value}, tail, *iters)
+        \\  else
+        \\    dict(target, *iters)
         \\  end
         \\end
     ),
@@ -83,6 +97,9 @@ const stdlib = .{
         \\  [start, stop] = count(start, stop, 1)
         \\  [stop] = count(0, stop, 1)
         \\end
+    ),
+    .@"@dict_tail" = (
+        \\|dict, key| |_| @dict_send(dict, key)
     ),
 };
 
@@ -212,7 +229,7 @@ pub const Runner = struct {
         }
     }
 
-    fn create(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !*obj_type.Detail() {
+    pub fn create(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !*obj_type.Detail() {
         const detail = try self.allocator.create(obj_type.Detail());
         detail.* = data;
         detail.obj = .{
@@ -261,12 +278,12 @@ pub const Runner = struct {
         }
     }
 
-    fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !Value {
+    pub fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !Value {
         const detail = try self.create(obj_type, data);
         return detail.obj.toValue();
     }
 
-    fn createList(self: *Runner, items: []const Value) !?*Value.Cons {
+    pub fn createList(self: *Runner, items: []const Value) !?*Value.Cons {
         var tail: ?*Value.Cons = null;
         var i = items.len;
         while (i > 0) {
@@ -276,7 +293,7 @@ pub const Runner = struct {
         return tail;
     }
 
-    fn createListValue(self: *Runner, items: []const Value) !Value {
+    pub fn createListValue(self: *Runner, items: []const Value) !Value {
         return Value.Cons.toValue(try self.createList(items));
     }
 
@@ -343,6 +360,24 @@ pub const Runner = struct {
                     const cons = try expectCons(call.stack.pop());
                     try call.stack.append(self.allocator, cons.head);
                     try call.stack.append(self.allocator, Value.Cons.toValue(cons.tail));
+                },
+                .empty_dict => {
+                    const dict = try self.createValue(.dict, .{ .data = Value.Dict.empty_data });
+                    try call.stack.append(self.allocator, dict);
+                },
+                .put_dict => {
+                    const value = call.stack.pop();
+                    const key = call.stack.pop();
+                    var dict = try expectDict(call.stack.pop());
+                    dict = try dict.put(self, key, value);
+                    try call.stack.append(self.allocator, dict.obj.toValue());
+                },
+                .pop_dict => {
+                    const key = call.stack.pop();
+                    const dict = try expectDict(call.stack.pop());
+                    const result = try dict.pop(self, key);
+                    try call.stack.append(self.allocator, result.value);
+                    try call.stack.append(self.allocator, result.dict.obj.toValue());
                 },
                 .lambda => |lambda| {
                     const stack = try self.allocator.alloc(Value, lambda.caps);
@@ -467,6 +502,25 @@ pub const Runner = struct {
                     const lhs = try expectNum(call.stack.pop());
                     try call.stack.append(self.allocator, .{ .bool = lhs >= rhs });
                 },
+                .in => {
+                    const rhs = call.stack.pop();
+                    const lhs = call.stack.pop();
+                    try call.stack.append(self.allocator, .{ .bool = switch (rhs) {
+                        .nil => false,
+                        .obj => |obj| switch (obj.type) {
+                            .cons => in: {
+                                var cons = Value.ObjType.cons.detailed(obj);
+                                while (true) {
+                                    if (cons.head.eql(lhs)) break :in true;
+                                    cons = cons.tail orelse break :in false;
+                                }
+                            },
+                            .dict => Value.ObjType.dict.detailed(obj).get(lhs) != null,
+                            else => return error.RunError,
+                        },
+                        else => return error.RunError,
+                    } });
+                },
 
                 .not => {
                     const value = call.stack.pop();
@@ -521,6 +575,16 @@ pub const Runner = struct {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
+                else => error.RunError,
+            },
+            else => error.RunError,
+        };
+    }
+
+    fn expectDict(value: Value) !*Value.Dict {
+        return switch (value) {
+            .obj => |obj| switch (obj.type) {
+                .dict => @fieldParentPtr("obj", obj),
                 else => error.RunError,
             },
             else => error.RunError,
@@ -600,6 +664,14 @@ pub const Runner = struct {
             return .{ .bool = switch (arg) {
                 .nil => true,
                 .obj => |obj| obj.type == .cons,
+                else => false,
+            } };
+        }
+
+        fn is_dict(_: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = switch (arg) {
+                .obj => |obj| obj.type == .dict,
                 else => false,
             } };
         }
@@ -712,6 +784,24 @@ pub const Runner = struct {
                 tail = .null;
             }
 
+            return try self.createListValue(&.{ head, tail });
+        }
+
+        fn @"@dict_send"(self: *Runner, args: ?*Value.Cons) Error!Value {
+            var arg_iter = Value.Cons.iter(args);
+            const dict = try expectDict(try arg_iter.expectNext());
+            const key = arg_iter.next();
+            try arg_iter.expectEnd();
+
+            var head: Value = undefined;
+            var tail: Value = undefined;
+            if (dict.next(key)) |item| {
+                head = item.obj.toValue();
+                tail = try self.runGlobal("@dict_tail", &.{ dict.obj.toValue(), item.head });
+            } else {
+                head = .null;
+                tail = .null;
+            }
             return try self.createListValue(&.{ head, tail });
         }
     };
@@ -950,4 +1040,39 @@ test "run closure" {
     const value = try runner.runProgram(program);
 
     try std.testing.expectEqualDeep(Value{ .num = 8 }, value);
+}
+test "compile dict" {
+    var runner = try Runner.init(std.testing.allocator);
+    defer runner.deinit();
+
+    const program = try cloneProgram(.{
+        .instrs = &.{
+            .empty_dict,
+            .{ .short_str = Value.toShort("foo").? },
+            .{ .num = 1 },
+            .put_dict,
+            .{ .short_str = Value.toShort("bar").? },
+            .{ .num = 2 },
+            .put_dict,
+            .{ .short_str = Value.toShort("baz").? },
+            .{ .num = 3 },
+            .put_dict,
+            .{ .short_str = Value.toShort("foo").? },
+            .{ .local = 1 },
+            .{ .local = 0 },
+            .in,
+            .{ .jmp_if = 3 },
+            .{ .pop = 1 },
+            .{ .pop = 0 },
+            .no_match,
+            .pop_dict,
+            .{ .pop = 1 },
+            .{ .local = 0 },
+            .ret,
+        },
+        .data = "",
+    });
+    const value = try runner.runProgram(program);
+
+    try std.testing.expectEqualDeep(Value{ .num = 1 }, value);
 }

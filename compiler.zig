@@ -172,6 +172,57 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .list;
             },
+            .dict => return try self.compileExpr(.{ .dicts = &.{expr} }, usage),
+            .dicts => |cols| {
+                var n = cols.len;
+                while (n > 0 and cols[n - 1] == .dict) n -= 1;
+
+                switch (n) {
+                    0 => try self.instrs.append(.empty_dict),
+                    1 => {
+                        var index = self.instrs.items.len;
+                        const curr = self.stack.size();
+                        const info = try self.compileExpr(cols[0], .used);
+
+                        if (!info.isDict()) {
+                            while (index < self.instrs.items.len) : (index += 1) {
+                                switch (self.instrs.items[index]) {
+                                    .local, .pop => |*j| {
+                                        if (j.* >= curr) j.* += 1;
+                                    },
+                                    .lambda => |lambda| index += lambda.len,
+                                    else => {},
+                                }
+                            }
+
+                            try self.insertInstr(index, .{ .global = .dict });
+                            try self.instrs.append(.nil);
+                            try self.instrs.append(.cons);
+                            try self.instrs.append(.call);
+                        }
+                    },
+                    else => {
+                        _ = try self.compileExpr(.{ .call = &.{
+                            .lhs = .{ .global = .dict },
+                            .rhs = .{ .list = cols[0..n] },
+                        } }, .used);
+                    },
+                }
+
+                try self.stack.push(null);
+                for (cols[n..]) |col| {
+                    for (col.dict) |pair| {
+                        _ = try self.compileExpr(pair.key, .used);
+                        try self.stack.push(null);
+                        _ = try self.compileExpr(pair.value, .used);
+                        self.stack.pop();
+                        try self.instrs.append(.put_dict);
+                    }
+                }
+                self.stack.pop();
+
+                return .dict;
+            },
             inline .lambda, .gen => |value, tag| {
                 var compiler = Compiler.init(self.buffer);
                 defer compiler.deinit();
@@ -575,6 +626,57 @@ pub const Compiler = struct {
                     else => unreachable,
                 }
             },
+            .dict => try self.compilePattern(.{ .dicts = &.{pattern} }, info, to_next, start),
+            .dicts => |cols| {
+                if (!info.isDict()) {
+                    try self.instrs.append(.{ .global = .is_dict });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.compileNoMatch(true, to_next, start, 1);
+                }
+
+                var i: usize = 0;
+                while (i < cols.len and cols[i] == .dict) : (i += 1) {
+                    for (cols[i].dict) |item| {
+                        try self.stack.push(null);
+                        _ = try self.compileExpr(item.key, .used);
+                        self.stack.pop();
+
+                        try self.instrs.append(.{ .local = self.stack.size() + 1 });
+                        try self.instrs.append(.{ .local = self.stack.size() });
+                        try self.instrs.append(.in);
+                        try self.compileNoMatch(true, to_next, start, 2);
+                        try self.instrs.append(.pop_dict);
+
+                        if (item.value == .name and self.stack.getFromIndex(start, item.value.name) == null) {
+                            try self.stack.push(.{ .name = item.value.name, .info = .any });
+                        } else if (item.value == .ignore) {
+                            try self.instrs.append(.{ .pop = self.stack.size() });
+                        } else {
+                            const curr = self.stack.size();
+                            try self.instrs.append(.{ .local = curr });
+                            try self.instrs.append(.{ .pop = curr });
+
+                            try self.stack.push(null);
+                            try self.compilePattern(item.value, .any, to_next, start);
+                            _ = self.stack.entries.orderedRemove(start);
+
+                            if (self.stack.size() != curr) {
+                                try self.instrs.append(.{ .local = curr });
+                                try self.instrs.append(.{ .pop = curr });
+                            }
+                        }
+                    }
+                }
+
+                switch (cols.len - i) {
+                    0 => try self.compileNoMatch(false, to_next, start, 0),
+                    1 => try self.compilePattern(cols[i], .dict, to_next, start),
+                    else => unreachable,
+                }
+            },
         }
     }
 
@@ -641,6 +743,7 @@ const Usage = union(enum) { returned, used, ignored };
 const Info = enum {
     any,
     list,
+    dict,
     all,
 
     fn merge(self: Info, other: Info) Info {
@@ -651,6 +754,10 @@ const Info = enum {
 
     fn isList(self: Info) bool {
         return self == .list or self == .all;
+    }
+
+    fn isDict(self: Info) bool {
+        return self == .dict or self == .all;
     }
 };
 
@@ -906,5 +1013,50 @@ test "compile closure" {
         .nil,
         .cons,
         .tail_call,
+    }, program.instrs);
+}
+
+test "compile dict" {
+    const program = try compile(std.testing.allocator, .{ .match = &.{
+        .subject = .{ .dict = &.{
+            .{ .key = .{ .str = "foo" }, .value = .{ .num = 1 } },
+            .{ .key = .{ .str = "bar" }, .value = .{ .num = 2 } },
+            .{ .key = .{ .str = "baz" }, .value = .{ .num = 3 } },
+        } },
+        .matchers = &.{.{
+            .pattern = .{ .dicts = &.{
+                .{ .dict = &.{
+                    .{ .key = .{ .str = "foo" }, .value = .{ .name = "foo" } },
+                } },
+                .ignore,
+            } },
+            .expr = .{ .name = "foo" },
+        }},
+    } });
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(Instr, &.{
+        .empty_dict,
+        .{ .short_str = Value.toShort("foo").? },
+        .{ .num = 1 },
+        .put_dict,
+        .{ .short_str = Value.toShort("bar").? },
+        .{ .num = 2 },
+        .put_dict,
+        .{ .short_str = Value.toShort("baz").? },
+        .{ .num = 3 },
+        .put_dict,
+        .{ .short_str = Value.toShort("foo").? },
+        .{ .local = 1 },
+        .{ .local = 0 },
+        .in,
+        .{ .jmp_if = 3 },
+        .{ .pop = 1 },
+        .{ .pop = 0 },
+        .no_match,
+        .pop_dict,
+        .{ .pop = 1 },
+        .{ .local = 0 },
+        .ret,
     }, program.instrs);
 }

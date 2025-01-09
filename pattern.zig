@@ -9,6 +9,8 @@ pub const Pattern = union(enum) {
 
     list: []const Pattern,
     lists: []const Pattern,
+    dict: []const Pattern.Pair,
+    dicts: []const Pattern,
 
     pub fn deinit(self: Pattern, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -17,7 +19,7 @@ pub const Pattern = union(enum) {
                 expr.deinit(allocator);
                 allocator.destroy(expr);
             },
-            .list, .lists => |items| {
+            inline .list, .lists, .dict, .dicts => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
             },
@@ -33,8 +35,8 @@ pub const Pattern = union(enum) {
                 copy.* = try expr.clone(allocator);
                 return .{ .expr = copy };
             },
-            inline .list, .lists => |items, tag| {
-                const copies = try allocator.alloc(Pattern, items.len);
+            inline .list, .lists, .dict, .dicts => |items, tag| {
+                const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
                 errdefer {
                     allocator.free(copies);
@@ -47,4 +49,22 @@ pub const Pattern = union(enum) {
             },
         }
     }
+
+    pub const Pair = struct {
+        key: Expr,
+        value: Pattern,
+
+        pub fn deinit(self: Pair, allocator: std.mem.Allocator) void {
+            self.key.deinit(allocator);
+            self.value.deinit(allocator);
+        }
+
+        pub fn clone(self: Pair, allocator: std.mem.Allocator) std.mem.Allocator.Error!Pair {
+            var copy: Pair = undefined;
+            copy.key = try self.key.clone(allocator);
+            errdefer copy.key.deinit(allocator);
+            copy.value = try self.value.clone(allocator);
+            return copy;
+        }
+    };
 };

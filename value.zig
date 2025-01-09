@@ -127,6 +127,10 @@ pub const Value = union(enum) {
         }
     }
 
+    pub fn hash(_: Value) u64 {
+        return 0;
+    }
+
     pub const Obj = struct {
         type: ObjType,
         prev: ?*Obj,
@@ -148,6 +152,7 @@ pub const Value = union(enum) {
     pub const ObjType = enum {
         program,
         cons,
+        dict,
         lambda,
         str,
 
@@ -155,6 +160,7 @@ pub const Value = union(enum) {
             return switch (self) {
                 .program => Program,
                 .cons => Cons,
+                .dict => Dict,
                 .lambda => Lambda,
                 .str => Str,
             };
@@ -281,6 +287,345 @@ pub const Value = union(enum) {
                 inline for (0..n) |i| values[i] = try self.expectNext();
                 try self.expectEnd();
                 return values;
+            }
+        };
+    };
+
+    pub const Dict = struct {
+        pub const bits = 4;
+        pub const len = 1 << bits;
+        pub const mask = len - 1;
+        pub const levels = (64 / bits) + (if (64 % bits == 0) 0 else 1);
+        pub const empty_data = [_]?*Obj{null} ** len;
+
+        obj: Obj = undefined,
+        data: [len]?*Obj,
+
+        pub fn eql(self: *Dict, other: *Dict) bool {
+            for (self.data, other.data) |maybe_self_obj, maybe_other_obj| {
+                const self_obj = maybe_self_obj orelse {
+                    if (maybe_other_obj != null) return false;
+                    continue;
+                };
+                const other_obj = maybe_other_obj orelse return false;
+
+                switch (self_obj.type) {
+                    .dict => {
+                        const self_cons = ObjType.dict.detailed(self_obj);
+                        const other_cons = ObjType.dict.detailed(other_obj);
+                        if (!self_cons.eql(other_cons)) return false;
+                    },
+                    .cons => {
+                        var self_cons = ObjType.cons.detailed(self_obj);
+                        var other_cons = ObjType.cons.detailed(other_obj);
+
+                        // we cant use normal equals since we dont want the
+                        // ordering to matter
+
+                        // First we check if all items in self are in other
+                        // and we count how many items are in self
+                        var items: usize = 0;
+                        while (true) {
+                            const item = self_cons.head;
+                            var other_cons_ = other_cons;
+                            const item_in_other = while (true) {
+                                if (other_cons_.head.eql(item)) break true;
+                                other_cons_ = other_cons_.tail orelse break false;
+                            };
+                            if (!item_in_other) return false;
+
+                            items += 1;
+                            self_cons = self_cons.tail orelse break;
+                        }
+
+                        // Now we check other has the same amount of items
+                        while (items > 0) {
+                            items -= 1;
+                            other_cons = other_cons.tail orelse break;
+                        } else return false;
+                        if (items > 0) return false;
+                    },
+                    else => unreachable,
+                }
+            }
+
+            return true;
+        }
+
+        pub fn truthy(self: *Dict) bool {
+            for (self.data) |maybe_obj| {
+                if (maybe_obj != null) return true;
+            }
+            return false;
+        }
+
+        pub fn allocated(_: *Dict) usize {
+            return 0;
+        }
+
+        pub fn mark(self: *Dict) void {
+            for (self.data) |maybe_obj| {
+                const obj = maybe_obj orelse continue;
+                obj.mark();
+            }
+        }
+
+        pub fn deinit(_: *Dict, _: std.mem.Allocator) void {}
+
+        pub fn write(self: *Dict, writer: anytype) !void {
+            try writer.print("{{", .{});
+
+            var dict_iter = self.iter();
+            var first = true;
+            while (dict_iter.next()) |item| {
+                if (first) {
+                    first = false;
+                } else {
+                    try writer.print(", ", .{});
+                }
+                try writer.print("{} = {}", .{ item[0], item[1] });
+            }
+
+            try writer.print("}}", .{});
+        }
+
+        pub fn get(self: *Dict, key: Value) ?Value {
+            var curr: DictOrCons = .{ .dict = self };
+
+            const key_hash = key.hash();
+            inline for (0..levels) |level| {
+                const obj = curr.dict.data[index(key_hash, level)] orelse return null;
+                const field = comptime if (level == levels - 1) "cons" else "dict";
+                curr = @unionInit(DictOrCons, field, @fieldParentPtr("obj", obj));
+            }
+
+            while (true) {
+                const item = ObjType.cons.detailed(curr.cons.head.obj);
+                if (item.head.eql(key)) return item.tail.?.head;
+                curr = .{ .cons = curr.cons.tail orelse return null };
+            }
+        }
+
+        pub fn put(self: *Dict, runner: *Runner, key: Value, value: Value) Runner.Error!*Dict {
+            var dicts: [levels - 1]?*Dict = undefined;
+            var cons: ?*Cons = undefined;
+
+            const key_hash = key.hash();
+            inline for (0..levels) |level| {
+                const maybe_dict: ?*Dict = if (level == 0) self else dicts[level - 1];
+                const maybe_obj: ?*Obj = if (maybe_dict) |dict| dict.data[index(key_hash, level)] else null;
+                if (level == levels - 1) {
+                    cons = if (maybe_obj) |obj| @fieldParentPtr("obj", obj) else null;
+                } else {
+                    dicts[level] = if (maybe_obj) |obj| @fieldParentPtr("obj", obj) else null;
+                }
+            }
+
+            var curr: DictOrCons = .{ .cons = try putCons(runner, cons, key, value) };
+
+            inline for (0..levels) |rev_level| {
+                const level = comptime levels - 1 - rev_level;
+
+                var data: [len]?*Obj = undefined;
+                if (level == 0) {
+                    data = self.data;
+                } else if (dicts[level - 1]) |dict| {
+                    data = dict.data;
+                } else {
+                    data = empty_data;
+                }
+
+                data[index(key_hash, level)] = if (rev_level == 0) &curr.cons.obj else &curr.dict.obj;
+                curr = .{ .dict = try runner.create(.dict, .{ .data = data }) };
+            }
+
+            return curr.dict;
+        }
+
+        pub fn putCons(runner: *Runner, tail: ?*Cons, key: Value, value: Value) Runner.Error!*Cons {
+            if (try replaceCons(runner, tail, key, value)) |cons| return cons;
+            const item = try runner.createListValue(&.{ key, value });
+            return try runner.create(.cons, .{ .head = item, .tail = tail });
+        }
+
+        pub fn replaceCons(runner: *Runner, tail: ?*Cons, key: Value, value: Value) Runner.Error!?*Cons {
+            const cons = tail orelse return null;
+            const item: *Cons = @fieldParentPtr("obj", cons.head.obj);
+            if (item.head.eql(key)) {
+                return try runner.create(.cons, .{
+                    .head = try runner.createListValue(&.{ key, value }),
+                    .tail = cons.tail,
+                });
+            } else if (try replaceCons(runner, cons.tail, key, value)) |replaced_tail| {
+                return try runner.create(.cons, .{
+                    .head = cons.head,
+                    .tail = replaced_tail,
+                });
+            } else {
+                return null;
+            }
+        }
+
+        pub fn pop(self: *Dict, runner: *Runner, key: Value) Runner.Error!DictPop {
+            var dicts: [levels - 1]*Dict = undefined;
+            var cons: *Cons = undefined;
+
+            const key_hash = key.hash();
+            inline for (0..levels) |level| {
+                const dict = if (level == 0) self else dicts[level - 1];
+                const obj = dict.data[index(key_hash, level)] orelse return error.RunError;
+                if (level == levels - 1) {
+                    cons = @fieldParentPtr("obj", obj);
+                } else {
+                    dicts[level] = @fieldParentPtr("obj", obj);
+                }
+            }
+
+            var value: Value = undefined;
+            var curr: ?DictOrCons = undefined;
+            {
+                const cons_pop = try popCons(runner, cons, key);
+                value = cons_pop.value;
+                curr = if (cons_pop.cons) |cons_| .{ .cons = cons_ } else null;
+            }
+
+            inline for (0..levels) |rev_level| {
+                const level = comptime levels - 1 - rev_level;
+
+                var data = if (level == 0) self.data else dicts[level - 1].data;
+
+                if (curr) |curr_| {
+                    data[index(key_hash, level)] = if (rev_level == 0) &curr_.cons.obj else &curr_.dict.obj;
+                } else {
+                    data[index(key_hash, level)] = null;
+                }
+
+                for (data) |obj| {
+                    if (obj != null) {
+                        curr = .{ .dict = try runner.create(.dict, .{ .data = data }) };
+                        break;
+                    }
+                } else {
+                    curr = null;
+                }
+            }
+
+            return .{
+                .value = value,
+                .dict = if (curr) |curr_| curr_.dict else try runner.create(.dict, .{ .data = empty_data }),
+            };
+        }
+
+        fn popCons(runner: *Runner, cons: *Cons, key: Value) Runner.Error!ConsPop {
+            const item: *Cons = @fieldParentPtr("obj", cons.head.obj);
+            if (item.head.eql(key)) {
+                return .{
+                    .value = item.tail.?.head,
+                    .cons = cons.tail,
+                };
+            } else {
+                const cons_pop = try popCons(runner, cons.tail orelse return error.RunError, key);
+                return .{
+                    .value = cons_pop.value,
+                    .cons = try runner.create(.cons, .{ .head = cons.head, .tail = cons_pop.cons }),
+                };
+            }
+        }
+
+        inline fn index(key_hash: u64, level: usize) usize {
+            return (key_hash >> @truncate(bits * level)) & mask;
+        }
+
+        const DictOrCons = union {
+            dict: *Dict,
+            cons: *Cons,
+        };
+
+        const DictPop = struct {
+            value: Value,
+            dict: *Dict,
+        };
+
+        const ConsPop = struct {
+            value: Value,
+            cons: ?*Cons,
+        };
+
+        pub fn next(self: *Dict, maybe_key: ?Value) ?*Cons {
+            const key = maybe_key orelse return self.firstItem(0);
+
+            var dicts: [levels - 1]*Dict = undefined;
+            var cons: *Cons = undefined;
+
+            const key_hash = key.hash();
+            inline for (0..levels) |level| {
+                const dict = if (level == 0) self else dicts[level - 1];
+                const obj = dict.data[index(key_hash, level)] orelse return null;
+                if (level == levels - 1) {
+                    cons = @fieldParentPtr("obj", obj);
+                } else {
+                    dicts[level] = @fieldParentPtr("obj", obj);
+                }
+            }
+
+            while (true) {
+                const item: *Cons = @fieldParentPtr("obj", cons.head.obj);
+                if (item.head.eql(key)) {
+                    cons = cons.tail orelse break;
+                    return @fieldParentPtr("obj", cons.head.obj);
+                } else {
+                    cons = cons.tail orelse return null;
+                }
+            }
+
+            var level: usize = levels;
+            while (level > 0) {
+                level -= 1;
+                const dict = if (level == 0) self else dicts[level - 1];
+                const obj = dict.firstObj(index(key_hash, level) + 1) orelse continue;
+                if (level == levels - 1) {
+                    const cons_: *Cons = @fieldParentPtr("obj", obj);
+                    return @fieldParentPtr("obj", cons_.head.obj);
+                } else {
+                    const dict_: *Dict = @fieldParentPtr("obj", obj);
+                    return dict_.firstItem(level).?;
+                }
+            }
+
+            return null;
+        }
+
+        fn firstItem(self: *Dict, init_level: usize) ?*Cons {
+            var obj = self.firstObj(0) orelse return null;
+            for (init_level + 1..levels) |_| {
+                const dict: *Dict = @fieldParentPtr("obj", obj);
+                obj = dict.firstObj(0).?;
+            }
+            const cons: *Cons = @fieldParentPtr("obj", obj);
+            return @fieldParentPtr("obj", cons.head.obj);
+        }
+
+        fn firstObj(self: *Dict, init_index: usize) ?*Obj {
+            for (self.data[init_index..]) |maybe_obj| {
+                if (maybe_obj) |obj| return obj;
+            }
+            return null;
+        }
+
+        fn iter(self: *Dict) Iter {
+            return .{ .dict = self };
+        }
+
+        const Iter = struct {
+            dict: *Dict,
+            key: ?Value = null,
+
+            fn next(self: *Iter) ?[2]Value {
+                const item = self.dict.next(self.key) orelse return null;
+                const key = item.head;
+                const value = item.tail.?.head;
+                self.key = key;
+                return .{ key, value };
             }
         };
     };

@@ -1,12 +1,1 @@
-get_fib = |get_fib| |*args| do
-	fib = get_fib(get_fib)
-	match args do
-		[0, a, _] = a
-		[n, a, b] = fib(n - 1, b, a + b)
-		[n]       = fib(n, 0, 1)
-	end
-end
-
-fib = get_fib(get_fib)
-
-print(fib(10))
+print({"foo" = 1, "bar" = 2, "baz" = 3})

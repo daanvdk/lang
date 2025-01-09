@@ -266,7 +266,7 @@ const Parser = struct {
         while (true) {
             if (self.peek(&.{.lpar})) {
                 errdefer lhs.deinit(self.allocator);
-                const rhs = try self.parseList(.expr, .lpar, .rpar);
+                const rhs = try self.parseCol(.list, .expr, .lpar, .rpar);
                 errdefer rhs.deinit(self.allocator);
 
                 const bin = try self.allocator.create(Expr.Bin);
@@ -286,11 +286,11 @@ const Parser = struct {
                 const old_skip = self.skip_newlines;
                 defer self.skip_newlines = old_skip;
                 self.skip_newlines = true;
-                var state = ListState(.expr).init(self.allocator);
+                var state = ColState(.list, .expr).init(self.allocator);
                 defer state.deinit();
-                try state.append(lhs, false);
+                try state.append(false, undefined, lhs);
                 owner = false;
-                bin.rhs = try self.parseListTail(.expr, &state, .rpar);
+                bin.rhs = try self.parseColTail(.list, .expr, &state, .rpar);
 
                 lhs = .{ .call = bin };
             } else {
@@ -315,7 +315,9 @@ const Parser = struct {
         } else if (parse_type != .expr and self.peek(&.{.ignore})) {
             return parse_type.fromPattern(try self.parseIgnore());
         } else if (self.peek(&.{.llist})) {
-            return try self.parseList(parse_type, .llist, .rlist);
+            return try self.parseCol(.list, parse_type, .llist, .rlist);
+        } else if (self.peek(&.{.ldict})) {
+            return try self.parseCol(.dict, parse_type, .ldict, .rdict);
         } else if (parse_type != .pattern and self.peek(&.{.lambda})) {
             return parse_type.fromExpr(try self.parseLambda());
         } else if (self.peek(&.{.lpar})) {
@@ -415,45 +417,71 @@ const Parser = struct {
         return .ignore;
     }
 
-    fn parseList(self: *Parser, comptime parse_type: ParseType, start: Token.Type, end: Token.Type) Error!parse_type.Result() {
+    fn parseCol(
+        self: *Parser,
+        comptime col_type: ColType,
+        comptime parse_type: ParseType,
+        start: Token.Type,
+        end: Token.Type,
+    ) Error!parse_type.Result() {
         _ = try self.expect(&.{start});
 
         const old_skip = self.skip_newlines;
         defer self.skip_newlines = old_skip;
         self.skip_newlines = true;
 
-        var state = ListState(parse_type).init(self.allocator);
+        var state = ColState(col_type, parse_type).init(self.allocator);
         defer state.deinit();
 
-        return try self.parseListTail(parse_type, &state, end);
+        return try self.parseColTail(col_type, parse_type, &state, end);
     }
 
-    fn parseListTail(self: *Parser, comptime parse_type: ParseType, state: *ListState(parse_type), end: Token.Type) Error!parse_type.Result() {
+    fn parseColTail(
+        self: *Parser,
+        comptime col_type: ColType,
+        comptime parse_type: ParseType,
+        state: *ColState(col_type, parse_type),
+        end: Token.Type,
+    ) Error!parse_type.Result() {
         while (self.skip(&.{end}) == null) {
             const is_col = self.skip(&.{.mul}) != null;
-            const item = try self.parseExpr(parse_type);
             var owner = true;
+
+            var key: Expr = undefined;
+            if (col_type == .dict and !is_col) {
+                key = try self.parseExpr(.expr);
+                errdefer key.deinit(self.allocator);
+                _ = try self.expect(&.{.assign});
+            }
+            errdefer if (col_type == .dict and !is_col and owner) key.deinit(self.allocator);
+
+            const item = try self.parseExpr(parse_type);
             errdefer if (owner) item.deinit(self.allocator);
+
             if (!self.peek(&.{end})) _ = try self.expect(&.{.comma});
 
             switch (parse_type) {
-                .expr, .pattern => try state.append(item, is_col),
+                .expr, .pattern => {
+                    try state.append(is_col, key, item);
+                },
                 .both => switch (item) {
                     .expr => |expr| {
                         var expr_state = try state.toExpr();
                         defer expr_state.deinit();
-                        try expr_state.append(expr, is_col);
+                        try expr_state.append(is_col, key, expr);
                         owner = false;
-                        return parse_type.fromExpr(try self.parseListTail(.expr, &expr_state, end));
+                        return parse_type.fromExpr(try self.parseColTail(col_type, .expr, &expr_state, end));
                     },
                     .pattern => |pattern| {
                         var pattern_state = try state.toPattern();
                         defer pattern_state.deinit();
-                        try pattern_state.append(pattern, is_col);
+                        try pattern_state.append(is_col, key, pattern);
                         owner = false;
-                        return parse_type.fromPattern(try self.parseListTail(.pattern, &pattern_state, end));
+                        return parse_type.fromPattern(try self.parseColTail(col_type, .pattern, &pattern_state, end));
                     },
-                    .both => |both| try state.append(both, is_col),
+                    .both => |both| {
+                        try state.append(is_col, key, both);
+                    },
                 },
             }
         }
@@ -467,7 +495,7 @@ const Parser = struct {
 
         const matcher = try self.allocator.create(Expr.Matcher);
         errdefer self.allocator.destroy(matcher);
-        matcher.pattern = try self.parseList(.pattern, .lambda, .lambda);
+        matcher.pattern = try self.parseCol(.list, .pattern, .lambda, .lambda);
         errdefer matcher.pattern.deinit(self.allocator);
         matcher.expr = try self.parseExpr(.expr);
         return .{ .lambda = matcher };
@@ -866,25 +894,41 @@ const Both = struct {
         self.expr.deinit(allocator);
         self.pattern.deinit(allocator);
     }
+
+    const Pair = struct {
+        key: Expr,
+        value: Both,
+
+        fn deinit(self: Pair, allocator: std.mem.Allocator) void {
+            self.key.deinit(allocator);
+            self.value.deinit(allocator);
+        }
+    };
 };
 
-fn ListState(comptime parse_type: ParseType) type {
+const ColType = enum { list, dict };
+
+fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
     return struct {
-        const Item = switch (parse_type) {
+        const Col = switch (parse_type) {
             .expr => Expr,
             .pattern => Pattern,
             .both => Both,
         };
+        const Item = switch (col_type) {
+            .list => Col,
+            .dict => Col.Pair,
+        };
 
         items: std.ArrayList(Item),
-        cols: std.ArrayList(Item),
+        cols: std.ArrayList(Col),
 
         const Self = @This();
 
         fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .items = std.ArrayList(Item).init(allocator),
-                .cols = std.ArrayList(Item).init(allocator),
+                .cols = std.ArrayList(Col).init(allocator),
             };
         }
 
@@ -895,25 +939,40 @@ fn ListState(comptime parse_type: ParseType) type {
             self.cols.deinit();
         }
 
-        fn append(self: *Self, item: Item, is_col: bool) !void {
+        inline fn append(self: *Self, is_col: bool, key: Expr, value: Col) !void {
             if (is_col) {
-                try self.itemsToCol();
-                try self.cols.append(item);
+                try self.appendCol(value);
+            } else if (col_type == .dict) {
+                try self.appendItem(.{ .key = key, .value = value });
             } else {
-                try self.items.append(item);
+                try self.appendItem(value);
             }
         }
 
-        fn toExpr(self: *Self) !ListState(.expr) {
+        fn appendItem(self: *Self, item: Item) !void {
+            try self.items.append(item);
+        }
+
+        fn appendCol(self: *Self, col: Col) !void {
+            try self.itemsToCol();
+            try self.cols.append(col);
+        }
+
+        fn toExpr(self: *Self) !ColState(col_type, .expr) {
             if (parse_type != .both) unreachable;
 
-            var expr_state = ListState(.expr).init(self.items.allocator);
+            var expr_state = ColState(col_type, .expr).init(self.items.allocator);
             errdefer expr_state.deinit();
 
             try expr_state.items.ensureUnusedCapacity(self.items.items.len);
             for (self.items.items) |both| {
-                both.pattern.deinit(self.items.allocator);
-                expr_state.items.appendAssumeCapacity(both.expr);
+                if (col_type == .dict) {
+                    both.value.pattern.deinit(self.items.allocator);
+                    expr_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.expr });
+                } else {
+                    both.pattern.deinit(self.items.allocator);
+                    expr_state.items.appendAssumeCapacity(both.expr);
+                }
             }
             self.items.clearAndFree();
 
@@ -927,16 +986,21 @@ fn ListState(comptime parse_type: ParseType) type {
             return expr_state;
         }
 
-        fn toPattern(self: *Self) !ListState(.pattern) {
+        fn toPattern(self: *Self) !ColState(col_type, .pattern) {
             if (parse_type != .both) unreachable;
 
-            var pattern_state = ListState(.pattern).init(self.items.allocator);
+            var pattern_state = ColState(col_type, .pattern).init(self.items.allocator);
             errdefer pattern_state.deinit();
 
             try pattern_state.items.ensureUnusedCapacity(self.items.items.len);
             for (self.items.items) |both| {
-                both.expr.deinit(self.items.allocator);
-                pattern_state.items.appendAssumeCapacity(both.pattern);
+                if (col_type == .dict) {
+                    both.value.expr.deinit(self.items.allocator);
+                    pattern_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.pattern });
+                } else {
+                    both.expr.deinit(self.items.allocator);
+                    pattern_state.items.appendAssumeCapacity(both.pattern);
+                }
             }
             self.items.clearAndFree();
 
@@ -950,17 +1014,32 @@ fn ListState(comptime parse_type: ParseType) type {
             return pattern_state;
         }
 
-        fn aggregate(self: *Self, comptime field: []const u8, comptime tag: []const u8) !Item {
+        fn aggregate(self: *Self, comptime field: []const u8, comptime tag: []const u8) !Col {
             switch (parse_type) {
-                .expr, .pattern => return @unionInit(Item, tag, try @field(self, field).toOwnedSlice()),
+                .expr, .pattern => {
+                    return @unionInit(Col, tag, try @field(self, field).toOwnedSlice());
+                },
                 .both => {
-                    const exprs = try self.items.allocator.alloc(Expr, @field(self, field).items.len);
-                    errdefer self.items.allocator.free(exprs);
-                    const patterns = try self.items.allocator.alloc(Pattern, @field(self, field).items.len);
+                    const allocator = self.items.allocator;
+                    const is_pair = comptime col_type == .dict and std.mem.eql(u8, field, "items");
 
-                    for (0.., @field(self, field).items) |i, both| {
-                        exprs[i] = both.expr;
-                        patterns[i] = both.pattern;
+                    const exprs = try allocator.alloc(if (is_pair) Expr.Pair else Expr, @field(self, field).items.len);
+                    errdefer allocator.free(exprs);
+                    const patterns = try allocator.alloc(if (is_pair) Pattern.Pair else Pattern, @field(self, field).items.len);
+
+                    var i: usize = 0;
+                    errdefer if (is_pair) {
+                        for (patterns[0..i]) |pattern| pattern.key.deinit(allocator);
+                    };
+                    while (i < @field(self, field).items.len) : (i += 1) {
+                        const both = @field(self, field).items[i];
+                        if (is_pair) {
+                            exprs[i] = .{ .key = both.key, .value = both.value.expr };
+                            patterns[i] = .{ .key = try both.key.clone(allocator), .value = both.value.pattern };
+                        } else {
+                            exprs[i] = both.expr;
+                            patterns[i] = both.pattern;
+                        }
                     }
                     @field(self, field).clearAndFree();
 
@@ -974,20 +1053,20 @@ fn ListState(comptime parse_type: ParseType) type {
 
         fn itemsToCol(self: *Self) !void {
             if (self.items.items.len == 0) return;
-            const col = try self.aggregate("items", "list");
+            const col = try self.aggregate("items", @tagName(col_type));
             errdefer col.deinit(self.items.allocator);
             try self.cols.append(col);
         }
 
         fn toResult(self: *Self) !parse_type.Result() {
-            var item: Item = undefined;
+            var result: Col = undefined;
             if (self.cols.items.len == 0) {
-                item = try self.aggregate("items", "list");
+                result = try self.aggregate("items", @tagName(col_type));
             } else {
                 try self.itemsToCol();
-                item = try self.aggregate("cols", "lists");
+                result = try self.aggregate("cols", @tagName(col_type) ++ "s");
             }
-            return if (parse_type == .both) .{ .both = item } else item;
+            return if (parse_type == .both) .{ .both = result } else result;
         }
     };
 }
@@ -1147,6 +1226,30 @@ test "parse closure" {
                     } },
                 }},
             } },
+        }},
+    } }, expr);
+}
+
+test "parse dict" {
+    const expr = try parse(std.testing.allocator, (
+        \\{"foo" = foo, *_} = {"foo" = 1, "bar" = 2, "baz" = 3}
+        \\foo
+    ));
+    defer expr.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(Expr{ .match = &.{
+        .subject = .{ .dict = &.{
+            .{ .key = .{ .str = "foo" }, .value = .{ .num = 1 } },
+            .{ .key = .{ .str = "bar" }, .value = .{ .num = 2 } },
+            .{ .key = .{ .str = "baz" }, .value = .{ .num = 3 } },
+        } },
+        .matchers = &.{.{
+            .pattern = .{ .dicts = &.{
+                .{ .dict = &.{
+                    .{ .key = .{ .str = "foo" }, .value = .{ .name = "foo" } },
+                } },
+                .ignore,
+            } },
+            .expr = .{ .name = "foo" },
         }},
     } }, expr);
 }
