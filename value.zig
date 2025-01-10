@@ -622,7 +622,7 @@ pub const Value = union(enum) {
                     return @fieldParentPtr("obj", cons_.head.obj);
                 } else {
                     const dict_: *Dict = @fieldParentPtr("obj", obj);
-                    return dict_.firstItem(level).?;
+                    return dict_.firstItem(level + 1).?;
                 }
             }
 

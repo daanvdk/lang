@@ -595,7 +595,27 @@ pub const Compiler = struct {
                         } });
                         if (stmt.is_pub) try putPub(&pub_exprs, &pub_expr_indexes, fn_name, null);
                     } else {
-                        const info = try self.compileExpr(stmt.subject, .used);
+                        var subject = try stmt.subject.clone(allocator);
+                        defer subject.deinit(allocator);
+
+                        var i = mod_exprs.items.len;
+                        while (i > 0) {
+                            i -= 1;
+                            const mod_expr = mod_exprs.items[i];
+                            if (fn_keys.get(mod_expr.name) == null or !subject.usesName(mod_expr.name)) continue;
+
+                            const matchers = try allocator.alloc(Expr.Matcher, 1);
+                            errdefer allocator.free(matchers);
+                            matchers[0] = .{ .pattern = .{ .name = mod_expr.name }, .expr = subject };
+
+                            const match = try allocator.create(Expr.Match);
+                            errdefer allocator.destroy(match);
+                            match.* = .{ .subject = try mod_expr.expr.clone(allocator), .matchers = matchers };
+
+                            subject = .{ .match = match };
+                        }
+
+                        const info = try self.compileExpr(subject, .used);
                         try self.compilePattern(stmt.pattern, info, null, offset + 1);
 
                         if (offset < self.stack.size() - 1) {

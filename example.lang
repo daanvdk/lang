@@ -1,5 +1,17 @@
-{fib} = import("./fib")
+{fib_iter, *_} = import("./fib")
+
+fn take(iter, n) do*
+	if n <= 0 do return null end
+	[head, tail] = next(iter) else return null
+	yield head
+	yield* take(tail, n - 1)
+end
 
 pub fn main() do
-	print(fib(10))
+	print(
+		fib_iter
+		->take(10)
+		->map(|x| "(${x})")
+		->join("-")
+	)
 end

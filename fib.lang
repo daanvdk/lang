@@ -3,3 +3,10 @@ pub fn fib(*args) match args do
 	[n, a, b] if n > 0 = fib(n - 1, b, a + b)
 	[n]                = fib(n, 0, 1)
 end
+
+fn get_fib_iter(a, b) do*
+	yield a
+	yield* get_fib_iter(b, a + b)
+end
+
+pub fib_iter = get_fib_iter(0, 1)
