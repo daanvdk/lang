@@ -158,6 +158,7 @@ pub const Runner = struct {
 
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(*Call) = .{},
+    modules: std.StringHashMapUnmanaged(Value) = .{},
     last: ?*Value.Obj = null,
     stdlib_values: StdlibValues,
 
@@ -198,10 +199,8 @@ pub const Runner = struct {
 
         const program = program: {
             errdefer base_program.deinit(allocator);
-            const path = try allocator.alloc(u8, 0);
-            errdefer allocator.free(path);
             break :program try self.create(.program, .{
-                .path = path,
+                .path = "<stdlib>",
                 .instrs = base_program.instrs,
                 .data = base_program.data,
             });
@@ -224,6 +223,10 @@ pub const Runner = struct {
 
     pub fn deinit(self: *Runner) void {
         self.calls.deinit(self.allocator);
+
+        var path_iter = self.modules.keyIterator();
+        while (path_iter.next()) |path| self.allocator.free(path.*);
+        self.modules.deinit(self.allocator);
 
         while (self.last) |obj| {
             self.last = obj.prev;
@@ -273,6 +276,9 @@ pub const Runner = struct {
             for (call.stack.items) |value| value.mark();
         }
 
+        var module_iter = self.modules.valueIterator();
+        while (module_iter.next()) |module| module.mark();
+
         var curr = &self.last;
         while (curr.*) |obj| {
             if (obj.seen) {
@@ -298,7 +304,6 @@ pub const Runner = struct {
     }
 
     pub fn createProgram(self: *Runner, path: []const u8, program: Program) !*Value.Program {
-        errdefer self.allocator.free(path);
         errdefer program.deinit(self.allocator);
         return try self.create(.program, .{
             .path = path,
@@ -322,8 +327,17 @@ pub const Runner = struct {
     }
 
     pub fn runPath(self: *Runner, path: []const u8) Error!Value {
+        errdefer self.allocator.free(path);
+
+        const result = try self.modules.getOrPut(self.allocator, path);
+        if (result.found_existing) {
+            self.allocator.free(path);
+            return result.value_ptr.*;
+        }
+
+        errdefer self.modules.removeByPtr(result.key_ptr);
+
         const program = program: {
-            errdefer self.allocator.free(path);
             const file = std.fs.cwd().openFile(path, .{}) catch return error.RunError;
             defer file.close();
 
@@ -341,7 +355,10 @@ pub const Runner = struct {
             defer expr.deinit(self.allocator);
             break :program try compile(self.allocator, expr);
         };
-        return try self.runProgram(path, program);
+
+        const value = try self.runProgram(path, program);
+        result.value_ptr.* = value;
+        return value;
     }
 
     pub fn runProgram(self: *Runner, path: []const u8, program: Program) Error!Value {

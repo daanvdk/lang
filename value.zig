@@ -204,13 +204,12 @@ pub const Value = union(enum) {
         }
 
         pub fn allocated(self: *Program) usize {
-            return @sizeOf(u8) * self.path.len + @sizeOf(Instr) * self.instrs.len + @sizeOf(u8) * self.data.len;
+            return @sizeOf(Instr) * self.instrs.len + @sizeOf(u8) * self.data.len;
         }
 
         pub fn mark(_: *Program) void {}
 
         pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
-            allocator.free(self.path);
             allocator.free(self.instrs);
             allocator.free(self.data);
         }
