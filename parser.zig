@@ -557,15 +557,31 @@ pub const Parser = struct {
             var owner = true;
 
             var key: Expr = undefined;
-            if (col_type == .dict and !is_col) {
+            var item: parse_type.Result() = undefined;
+
+            if (col_type != .dict or is_col) {
+                item = try self.parseExpr(parse_type);
+            } else if (self.peek(&.{.name}) and self.peekAhead(1, &.{ .comma, end })) {
+                const token = try self.expect(&.{.name});
+                key = .{ .str = try self.allocator.dupe(u8, token.content) };
+                item = switch (parse_type) {
+                    .expr, .pattern => .{ .name = token.content },
+                    .both => .{ .both = .{
+                        .expr = .{ .name = token.content },
+                        .pattern = .{ .name = token.content },
+                    } },
+                };
+            } else {
                 key = try self.parseExpr(.expr);
                 errdefer key.deinit(self.allocator);
                 _ = try self.expect(&.{.assign});
+                item = try self.parseExpr(parse_type);
             }
-            errdefer if (col_type == .dict and !is_col and owner) key.deinit(self.allocator);
 
-            const item = try self.parseExpr(parse_type);
-            errdefer if (owner) item.deinit(self.allocator);
+            errdefer if (owner) {
+                if (col_type == .dict and !is_col) key.deinit(self.allocator);
+                item.deinit(self.allocator);
+            };
 
             if (!self.peek(&.{end})) _ = try self.expect(&.{.comma});
 
@@ -846,6 +862,22 @@ pub const Parser = struct {
             self.expected.insert(token_type);
         }
         return found;
+    }
+
+    fn peekAhead(self: *Parser, n: usize, token_types: []const Token.Type) bool {
+        if (n == 0) return self.peek(token_types);
+
+        const lexer = self.lexer;
+        const token = self.token;
+        const expected = self.expected;
+        defer {
+            self.lexer = lexer;
+            self.token = token;
+            self.expected = expected;
+        }
+
+        self.token = null;
+        return self.peekAhead(n - 1, token_types);
     }
 
     fn skip(self: *Parser, token_types: []const Token.Type) ?Token {
