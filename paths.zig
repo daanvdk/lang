@@ -73,6 +73,12 @@ pub const PathBuilder = struct {
             try self.replace(".");
         }
     }
+
+    fn ensureSuffix(self: *PathBuilder) !void {
+        if (!std.mem.endsWith(u8, self.path.items, ".lang")) {
+            try self.path.appendSlice(".lang");
+        }
+    }
 };
 
 pub fn normalize(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -89,16 +95,62 @@ pub fn join(allocator: std.mem.Allocator, paths: []const []const u8) ![]const u8
     return try builder.result();
 }
 
-pub fn join_import(allocator: std.mem.Allocator, curr_path: []const u8, import_path: []const u8) ![]const u8 {
-    var builder = try PathBuilder.init(allocator);
-    defer builder.deinit();
+pub const ImportIter = struct {
+    allocator: std.mem.Allocator,
+    import_path: []const u8,
+    state: State,
 
-    try builder.append(curr_path);
-    try builder.pop();
-    try builder.append(import_path);
-    if (!std.mem.endsWith(u8, builder.path.items, ".lang")) {
-        try builder.path.appendSlice(".lang");
+    pub fn init(allocator: std.mem.Allocator, curr_path: []const u8, import_path: []const u8) ImportIter {
+        var self = ImportIter{
+            .allocator = allocator,
+            .import_path = import_path,
+            .state = undefined,
+        };
+
+        if (std.mem.startsWith(u8, import_path, "./") or std.mem.startsWith(u8, import_path, "../")) {
+            self.state = .{ .local = curr_path };
+        } else if (std.posix.getenv("LANG_PATH")) |path| {
+            self.state = .{ .paths = std.mem.tokenizeAny(u8, path, ":") };
+        } else {
+            self.state = .{ .local = null };
+        }
+
+        return self;
     }
 
-    return try builder.result();
-}
+    pub fn next(self: *ImportIter) !?[]const u8 {
+        switch (self.state) {
+            .local => |*local| {
+                const curr_path = local.* orelse return null;
+
+                var builder = try PathBuilder.init(self.allocator);
+                defer builder.deinit();
+                try builder.append(curr_path);
+                try builder.pop();
+                try builder.append(self.import_path);
+                try builder.ensureSuffix();
+                const result = try builder.result();
+
+                local.* = null;
+                return result;
+            },
+            .paths => |*paths| {
+                const path = paths.next() orelse return null;
+
+                var builder = try PathBuilder.init(self.allocator);
+                defer builder.deinit();
+                try builder.append(path);
+                try builder.append(self.import_path);
+                try builder.ensureSuffix();
+                const result = try builder.result();
+
+                return result;
+            },
+        }
+    }
+
+    const State = union(enum) {
+        local: ?[]const u8,
+        paths: std.mem.TokenIterator(u8, .any),
+    };
+};

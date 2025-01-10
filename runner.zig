@@ -327,7 +327,7 @@ pub const Runner = struct {
         return Value.Cons.toValue(try self.createList(items));
     }
 
-    pub fn runPath(self: *Runner, path: []const u8) Error!Value {
+    pub fn runPath(self: *Runner, path: []const u8) !Value {
         errdefer self.allocator.free(path);
 
         const result = try self.modules.getOrPut(self.allocator, path);
@@ -339,7 +339,10 @@ pub const Runner = struct {
         errdefer self.modules.removeByPtr(result.key_ptr);
 
         const program = program: {
-            const file = std.fs.cwd().openFile(path, .{}) catch return error.RunError;
+            const file = std.fs.cwd().openFile(path, .{}) catch |err| return switch (err) {
+                error.FileNotFound => error.FileNotFound,
+                else => error.RunError,
+            };
             defer file.close();
 
             const content = std.posix.mmap(
@@ -894,16 +897,18 @@ pub const Runner = struct {
             const import_path = try expectStr(&arg);
             const curr_path = self.calls.items[self.calls.items.len - 1].program.path;
 
-            const path = paths.join_import(
-                self.allocator,
-                curr_path,
-                import_path,
-            ) catch |err| return switch (err) {
+            var import_paths = paths.ImportIter.init(self.allocator, curr_path, import_path);
+            while (import_paths.next() catch |err| return switch (err) {
                 error.PopRoot => error.RunError,
                 inline else => |err_| err_,
-            };
+            }) |path| {
+                return self.runPath(path) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return error.RunError,
+                };
+            }
 
-            return try self.runPath(path);
+            return error.RunError;
         }
     };
 
