@@ -9,6 +9,7 @@ const internal_parse = @import("parser.zig").internal_parse;
 const compile = @import("compiler.zig").compile;
 const Buffer = @import("compiler.zig").Buffer;
 const Compiler = @import("compiler.zig").Compiler;
+const paths = @import("paths.zig");
 
 const suffix = ".lang";
 
@@ -891,21 +892,16 @@ pub const Runner = struct {
         fn import(self: *Runner, args: ?*Value.Cons) Error!Value {
             const arg = try Value.Cons.expectOne(args);
             const import_path = try expectStr(&arg);
-            if (std.fs.path.isAbsolute(import_path)) return error.RunError;
-
             const curr_path = self.calls.items[self.calls.items.len - 1].program.path;
-            var path: []u8 = undefined;
-            if (std.fs.path.dirname(curr_path)) |curr_dir| {
-                path = try std.fs.path.join(self.allocator, &.{ curr_dir, import_path });
-                errdefer self.allocator.free(path);
-                const base_len = path.len;
-                path = try self.allocator.realloc(path, base_len + suffix.len);
-                @memcpy(path[base_len..], suffix);
-            } else {
-                path = try self.allocator.alloc(u8, import_path.len + suffix.len);
-                @memcpy(path[0..import_path.len], import_path);
-                @memcpy(path[import_path.len..], suffix);
-            }
+
+            const path = paths.join_import(
+                self.allocator,
+                curr_path,
+                import_path,
+            ) catch |err| return switch (err) {
+                error.PopRoot => error.RunError,
+                inline else => |err_| err_,
+            };
 
             return try self.runPath(path);
         }

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Runner = @import("runner.zig").Runner;
 const Value = @import("value.zig").Value;
+const paths = @import("paths.zig");
 
 const MAIN = .{ .str = Value.toShort("main").? };
 
@@ -16,7 +17,7 @@ pub fn main() !void {
     var args = std.process.args();
     _ = args.next();
     while (args.next()) |arg| {
-        const path = try allocator.dupe(u8, arg);
+        const path = try paths.normalize(allocator, arg);
         const module = try Runner.expectDict(try runner.runPath(path));
         if (module.get(MAIN)) |main_| _ = try runner.runLambda(main_, &.{});
     }

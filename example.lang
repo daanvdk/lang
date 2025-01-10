@@ -1,4 +1,4 @@
-{fib} = import("fib")
+{fib} = import("./fib")
 
 pub fn main() do
 	print(fib(10))
