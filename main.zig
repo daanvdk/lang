@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const parse = @import("parser.zig").parse;
-const compile = @import("compiler.zig").compile;
 const Runner = @import("runner.zig").Runner;
 const Value = @import("value.zig").Value;
 
@@ -18,27 +16,8 @@ pub fn main() !void {
     var args = std.process.args();
     _ = args.next();
     while (args.next()) |arg| {
-        const module = try Runner.expectDict(try runner.runProgram(program: {
-            const file = try std.fs.cwd().openFile(arg, .{});
-            defer file.close();
-
-            const content = try std.posix.mmap(
-                null,
-                (try file.metadata()).size(),
-                std.posix.PROT.READ,
-                .{ .TYPE = .SHARED },
-                file.handle,
-                0,
-            );
-            defer std.posix.munmap(content);
-
-            const expr = try parse(allocator, content);
-            defer expr.deinit(allocator);
-            break :program try compile(allocator, expr);
-        }));
-
-        if (module.get(MAIN)) |main_| {
-            _ = try runner.runLambda(main_, &.{});
-        }
+        const path = try allocator.dupe(u8, arg);
+        const module = try Runner.expectDict(try runner.runPath(path));
+        if (module.get(MAIN)) |main_| _ = try runner.runLambda(main_, &.{});
     }
 }

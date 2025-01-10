@@ -3,9 +3,14 @@ const std = @import("std");
 const Program = @import("program.zig").Program;
 const Instr = @import("instr.zig").Instr;
 const Value = @import("value.zig").Value;
+const parse = @import("parser.zig").parse;
+const Parser = @import("parser.zig").Parser;
 const internal_parse = @import("parser.zig").internal_parse;
+const compile = @import("compiler.zig").compile;
 const Buffer = @import("compiler.zig").Buffer;
 const Compiler = @import("compiler.zig").Compiler;
+
+const suffix = ".lang";
 
 const stdlib = .{
     .send = (
@@ -159,7 +164,7 @@ pub const Runner = struct {
     next_gc: usize,
     allocated: usize = 0,
 
-    pub const Error = std.mem.Allocator.Error || error{RunError};
+    pub const Error = std.mem.Allocator.Error || Parser.Error || Compiler.Error || error{RunError};
 
     pub fn init(allocator: std.mem.Allocator) Runner.Error!Runner {
         var offsets: StdlibOffsets = undefined;
@@ -173,15 +178,9 @@ pub const Runner = struct {
             inline for (@typeInfo(Stdlib).Struct.fields) |field| {
                 @field(offsets, field.name) = compiler.instrs.items.len;
                 const content = @field(stdlib, field.name);
-                const expr = internal_parse(allocator, content) catch |err| switch (err) {
-                    error.ParseError => unreachable,
-                    inline else => |err_| return err_,
-                };
+                const expr = try internal_parse(allocator, content);
                 defer expr.deinit(allocator);
-                _ = compiler.compileExpr(expr, .returned) catch |err| switch (err) {
-                    error.CompileError => unreachable,
-                    inline else => |err_| return err_,
-                };
+                _ = try compiler.compileExpr(expr, .returned);
             }
 
             const data = try buffer.content.toOwnedSlice();
@@ -197,9 +196,15 @@ pub const Runner = struct {
         };
         errdefer self.deinit();
 
-        const program = self.create(.program, .{ .instrs = base_program.instrs, .data = base_program.data }) catch |err| {
-            base_program.deinit(allocator);
-            return err;
+        const program = program: {
+            errdefer base_program.deinit(allocator);
+            const path = try allocator.alloc(u8, 0);
+            errdefer allocator.free(path);
+            break :program try self.create(.program, .{
+                .path = path,
+                .instrs = base_program.instrs,
+                .data = base_program.data,
+            });
         };
 
         inline for (@typeInfo(Stdlib).Struct.fields) |field| {
@@ -292,6 +297,16 @@ pub const Runner = struct {
         return detail.obj.toValue();
     }
 
+    pub fn createProgram(self: *Runner, path: []const u8, program: Program) !*Value.Program {
+        errdefer self.allocator.free(path);
+        errdefer program.deinit(self.allocator);
+        return try self.create(.program, .{
+            .path = path,
+            .instrs = program.instrs,
+            .data = program.data,
+        });
+    }
+
     pub fn createList(self: *Runner, items: []const Value) !?*Value.Cons {
         var tail: ?*Value.Cons = null;
         var i = items.len;
@@ -306,11 +321,31 @@ pub const Runner = struct {
         return Value.Cons.toValue(try self.createList(items));
     }
 
-    pub fn runProgram(self: *Runner, program: Program) Error!Value {
-        const program_ = self.create(.program, .{ .instrs = program.instrs, .data = program.data }) catch |err| {
-            program.deinit(self.allocator);
-            return err;
+    pub fn runPath(self: *Runner, path: []const u8) Error!Value {
+        const program = program: {
+            errdefer self.allocator.free(path);
+            const file = std.fs.cwd().openFile(path, .{}) catch return error.RunError;
+            defer file.close();
+
+            const content = std.posix.mmap(
+                null,
+                (file.metadata() catch return error.RunError).size(),
+                std.posix.PROT.READ,
+                .{ .TYPE = .SHARED },
+                file.handle,
+                0,
+            ) catch return error.RunError;
+            defer std.posix.munmap(content);
+
+            const expr = try parse(self.allocator, content);
+            defer expr.deinit(self.allocator);
+            break :program try compile(self.allocator, expr);
         };
+        return try self.runProgram(path, program);
+    }
+
+    pub fn runProgram(self: *Runner, path: []const u8, program: Program) Error!Value {
+        const program_ = try self.createProgram(path, program);
         var call = Call{ .program = program_, .offset = 0 };
         defer call.stack.deinit(self.allocator);
         return try self.run(&call);
@@ -834,6 +869,28 @@ pub const Runner = struct {
                 tail = .null;
             }
             return try self.createListValue(&.{ head, tail });
+        }
+
+        fn import(self: *Runner, args: ?*Value.Cons) Error!Value {
+            const arg = try Value.Cons.expectOne(args);
+            const import_path = try expectStr(&arg);
+            if (std.fs.path.isAbsolute(import_path)) return error.RunError;
+
+            const curr_path = self.calls.items[self.calls.items.len - 1].program.path;
+            var path: []u8 = undefined;
+            if (std.fs.path.dirname(curr_path)) |curr_dir| {
+                path = try std.fs.path.join(self.allocator, &.{ curr_dir, import_path });
+                errdefer self.allocator.free(path);
+                const base_len = path.len;
+                path = try self.allocator.realloc(path, base_len + suffix.len);
+                @memcpy(path[base_len..], suffix);
+            } else {
+                path = try self.allocator.alloc(u8, import_path.len + suffix.len);
+                @memcpy(path[0..import_path.len], import_path);
+                @memcpy(path[import_path.len..], suffix);
+            }
+
+            return try self.runPath(path);
         }
     };
 

@@ -65,6 +65,7 @@ pub const Instr = union(enum) {
         str,
         join,
         print,
+        import,
 
         next,
         send,

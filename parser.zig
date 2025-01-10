@@ -17,7 +17,7 @@ pub fn internal_parse(allocator: std.mem.Allocator, content: []const u8) Parser.
     return body.expr;
 }
 
-const Parser = struct {
+pub const Parser = struct {
     allocator: std.mem.Allocator,
     lexer: Lexer,
 
@@ -26,7 +26,7 @@ const Parser = struct {
     skip_newlines: bool = false,
     is_gen: bool = false,
 
-    const Error = std.mem.Allocator.Error || error{ParseError};
+    pub const Error = std.mem.Allocator.Error || error{ParseError};
 
     fn init(allocator: std.mem.Allocator, content: []const u8) Parser {
         return .{

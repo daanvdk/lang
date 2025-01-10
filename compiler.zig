@@ -49,7 +49,7 @@ pub const Compiler = struct {
     caps: std.ArrayList(Cap),
     is_gen: bool = false,
 
-    const Error = std.mem.Allocator.Error || error{CompileError};
+    pub const Error = std.mem.Allocator.Error || error{CompileError};
 
     pub fn init(buffer: *Buffer) Compiler {
         return .{
