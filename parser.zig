@@ -72,13 +72,13 @@ pub const Parser = struct {
                 stmt.subject = try self.parseExpr(.expr);
             } else if (stmt.is_pub) {
                 stmt.fn_name = null;
-                stmt.pattern = try self.parseExpr(.pattern);
+                stmt.pattern = try self.parseGuard(.pattern);
                 errdefer stmt.pattern.deinit(self.allocator);
                 _ = try self.expect(&.{.assign});
                 stmt.subject = try self.parseExpr(.expr);
             } else {
                 stmt.fn_name = null;
-                const result = try self.parseExpr(.both);
+                const result = try self.parseGuard(.both);
                 const assign = switch (result) {
                     .expr => false,
                     .pattern => assign: {
@@ -132,7 +132,7 @@ pub const Parser = struct {
                 last_expr = null;
             }
 
-            const result = try self.parseExpr(.both);
+            const result = try self.parseGuard(.both);
             const assign = switch (result) {
                 .expr => false,
                 .pattern => assign: {
@@ -189,6 +189,21 @@ pub const Parser = struct {
         }
 
         return .{ .expr = expr, .end = end };
+    }
+
+    fn parseGuard(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const result = try self.parseExpr(parse_type);
+        if (!parse_type.isPattern(result) or self.skip(&.{.@"if"}) == null) return result;
+
+        const pattern = parse_type.toPattern(self.allocator, result);
+        errdefer pattern.deinit(self.allocator);
+
+        const cond = try self.parseExpr(.expr);
+        errdefer cond.deinit(self.allocator);
+
+        const guard = try self.allocator.create(Pattern.Guard);
+        guard.* = .{ .pattern = pattern, .cond = cond };
+        return parse_type.fromPattern(.{ .guard = guard });
     }
 
     fn parseExpr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
@@ -650,7 +665,7 @@ pub const Parser = struct {
             while (self.skip(&.{.newline}) != null) {}
             if (self.skip(&.{.end}) != null) break;
 
-            const pattern = try self.parseExpr(.pattern);
+            const pattern = try self.parseGuard(.pattern);
             errdefer pattern.deinit(self.allocator);
 
             _ = try self.expect(&.{.assign});
@@ -683,7 +698,7 @@ pub const Parser = struct {
         }
 
         const has_else = while (true) {
-            const result = try self.parseExpr(.both);
+            const result = try self.parseGuard(.both);
             const assign = switch (result) {
                 .expr => false,
                 .pattern => assign: {

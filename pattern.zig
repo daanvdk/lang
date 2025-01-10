@@ -6,6 +6,7 @@ pub const Pattern = union(enum) {
     name: []const u8,
     ignore,
     expr: *const Expr,
+    guard: *const Guard,
 
     list: []const Pattern,
     lists: []const Pattern,
@@ -15,13 +16,13 @@ pub const Pattern = union(enum) {
     pub fn deinit(self: Pattern, allocator: std.mem.Allocator) void {
         switch (self) {
             .name, .ignore => {},
-            .expr => |expr| {
-                expr.deinit(allocator);
-                allocator.destroy(expr);
-            },
             inline .list, .lists, .dict, .dicts => |items| {
                 for (items) |item| item.deinit(allocator);
                 allocator.free(items);
+            },
+            inline else => |value| {
+                value.deinit(allocator);
+                allocator.destroy(value);
             },
         }
     }
@@ -29,12 +30,6 @@ pub const Pattern = union(enum) {
     pub fn clone(self: Pattern, allocator: std.mem.Allocator) std.mem.Allocator.Error!Pattern {
         switch (self) {
             .name, .ignore => return self,
-            .expr => |expr| {
-                const copy = try allocator.create(Expr);
-                errdefer allocator.destroy(copy);
-                copy.* = try expr.clone(allocator);
-                return .{ .expr = copy };
-            },
             inline .list, .lists, .dict, .dicts => |items, tag| {
                 const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
@@ -47,6 +42,12 @@ pub const Pattern = union(enum) {
                 }
                 return @unionInit(Pattern, @tagName(tag), copies);
             },
+            inline else => |value, tag| {
+                const copy = try allocator.create(@TypeOf(value.*));
+                errdefer allocator.destroy(copy);
+                copy.* = try value.clone(allocator);
+                return @unionInit(Pattern, @tagName(tag), copy);
+            },
         }
     }
 
@@ -54,12 +55,37 @@ pub const Pattern = union(enum) {
         return switch (self) {
             .name => |name_| if (std.mem.eql(u8, name_, name)) false else null,
             .ignore => null,
-            .expr => |expr| if (expr.usesName(name)) true else null,
             inline .list, .lists, .dict, .dicts => |items| for (items) |item| {
                 if (item.usesName(name)) |uses| break uses;
             } else null,
+            .expr => |expr| if (expr.usesName(name)) true else null,
+            inline else => |value| value.usesName(name),
         };
     }
+
+    pub const Guard = struct {
+        pattern: Pattern,
+        cond: Expr,
+
+        pub fn deinit(self: Guard, allocator: std.mem.Allocator) void {
+            self.pattern.deinit(allocator);
+            self.cond.deinit(allocator);
+        }
+
+        pub fn clone(self: Guard, allocator: std.mem.Allocator) std.mem.Allocator.Error!Guard {
+            var copy: Guard = undefined;
+            copy.pattern = try self.pattern.clone(allocator);
+            errdefer copy.pattern.deinit(allocator);
+            copy.cond = try self.cond.clone(allocator);
+            return copy;
+        }
+
+        pub fn usesName(self: Guard, name: []const u8) ?bool {
+            if (self.pattern.usesName(name)) |uses| return uses;
+            if (self.cond.usesName(name)) return true;
+            return null;
+        }
+    };
 
     pub const Pair = struct {
         key: Expr,

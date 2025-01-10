@@ -793,6 +793,11 @@ pub const Compiler = struct {
                 try self.instrs.append(.eq);
                 try self.compileNoMatch(true, to_next, start, 0);
             },
+            .guard => |guard| {
+                try self.compilePattern(guard.pattern, info, to_next, start);
+                _ = try self.compileExpr(guard.cond, .used);
+                try self.compileNoMatch(true, to_next, start, 0);
+            },
             .list => try self.compilePattern(.{ .lists = &.{pattern} }, info, to_next, start),
             .lists => |cols| {
                 if (!info.isList()) {
