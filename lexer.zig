@@ -312,6 +312,7 @@ pub const Lexer = struct {
         .in = .{"in"},
         .yield = .{"yield"},
         .@"return" = .{"return"},
+        .assert = .{"assert"},
         .@"pub" = .{"pub"},
         .@"fn" = .{"fn"},
     };

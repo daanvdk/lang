@@ -426,6 +426,8 @@ pub const Parser = struct {
             return parse_type.fromExpr(try self.parseYield());
         } else if (parse_type != .pattern and self.peek(&.{.@"return"})) {
             return parse_type.fromExpr(try self.parseReturn());
+        } else if (parse_type != .pattern and self.peek(&.{.assert})) {
+            return parse_type.fromExpr(try self.parseAssert());
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -798,6 +800,16 @@ pub const Parser = struct {
         expr.* = try self.parseExpr(.expr);
 
         return .{ .@"return" = expr };
+    }
+
+    fn parseAssert(self: *Parser) Error!Expr {
+        _ = try self.expect(&.{.assert});
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseExpr(.expr);
+
+        return .{ .assert = expr };
     }
 
     fn peek(self: *Parser, token_types: []const Token.Type) bool {

@@ -531,6 +531,12 @@ pub const Compiler = struct {
                 _ = try self.compileExpr(expr_ptr.*, .returned);
                 return .all;
             },
+            .assert => |expr_ptr| {
+                _ = try self.compileExpr(expr_ptr.*, .used);
+                try self.instrs.append(.{ .jmp_if = 1 });
+                try self.instrs.append(.no_match);
+                return try self.compileExpr(.null, usage);
+            },
             .module => |stmts| {
                 const allocator = self.instrs.allocator;
 

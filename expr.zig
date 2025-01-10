@@ -47,6 +47,7 @@ pub const Expr = union(enum) {
     yield: *const Expr,
     yield_all: *const Expr,
     @"return": *const Expr,
+    assert: *const Expr,
 
     module: []const Stmt,
 
