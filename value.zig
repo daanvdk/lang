@@ -127,14 +127,32 @@ pub const Value = union(enum) {
         }
     }
 
-    pub fn hash(_: Value) u64 {
-        return 0;
+    pub fn hash(self: Value) u64 {
+        var hasher = Hasher{};
+        if (self == .str) {
+            hasher.add(@intFromEnum(Value.obj));
+            hasher.add(@intFromEnum(ObjType.str));
+            for (fromShort(&self.str)) |char| hasher.add(char);
+        } else {
+            hasher.add(@intFromEnum(self));
+            switch (self) {
+                .num => |value| hasher.add(@bitCast(value)),
+                .bool => |value| hasher.add(if (value) 1 else 0),
+                .null => {},
+                .str => unreachable,
+                .nil => {},
+                .builtin => |value| hasher.add(@intFromPtr(value)),
+                .obj => |obj| hasher.add(obj.hash),
+            }
+        }
+        return hasher.hash;
     }
 
     pub const Obj = struct {
         type: ObjType,
         prev: ?*Obj,
         seen: bool,
+        hash: u64,
 
         pub fn toValue(self: *Obj) Value {
             return .{ .obj = self };
@@ -198,6 +216,11 @@ pub const Value = union(enum) {
         pub fn write(_: *Program, writer: anytype) !void {
             try writer.print("<program>", .{});
         }
+
+        pub fn hash(self: *const Program, hasher: *Hasher) void {
+            hasher.add(@intFromPtr(self.instrs.ptr));
+            hasher.add(@intFromPtr(self.data.ptr));
+        }
     };
 
     pub const Cons = struct {
@@ -257,6 +280,16 @@ pub const Value = union(enum) {
 
         pub fn iter(self: ?*Cons) Iter {
             return .{ .tail = self };
+        }
+
+        pub fn hash(self: *const Cons, hasher: *Hasher) void {
+            hasher.add(self.head.hash());
+            if (self.tail) |cons| {
+                hasher.add(1);
+                hasher.add(cons.obj.hash);
+            } else {
+                hasher.add(0);
+            }
         }
 
         pub const Iter = struct {
@@ -551,7 +584,7 @@ pub const Value = union(enum) {
             cons: ?*Cons,
         };
 
-        pub fn next(self: *Dict, maybe_key: ?Value) ?*Cons {
+        pub fn next(self: *const Dict, maybe_key: ?Value) ?*Cons {
             const key = maybe_key orelse return self.firstItem(0);
 
             var dicts: [levels - 1]*Dict = undefined;
@@ -595,7 +628,7 @@ pub const Value = union(enum) {
             return null;
         }
 
-        fn firstItem(self: *Dict, init_level: usize) ?*Cons {
+        fn firstItem(self: *const Dict, init_level: usize) ?*Cons {
             var obj = self.firstObj(0) orelse return null;
             for (init_level + 1..levels) |_| {
                 const dict: *Dict = @fieldParentPtr("obj", obj);
@@ -605,19 +638,19 @@ pub const Value = union(enum) {
             return @fieldParentPtr("obj", cons.head.obj);
         }
 
-        fn firstObj(self: *Dict, init_index: usize) ?*Obj {
+        fn firstObj(self: *const Dict, init_index: usize) ?*Obj {
             for (self.data[init_index..]) |maybe_obj| {
                 if (maybe_obj) |obj| return obj;
             }
             return null;
         }
 
-        fn iter(self: *Dict) Iter {
+        pub fn iter(self: *const Dict) Iter {
             return .{ .dict = self };
         }
 
         const Iter = struct {
-            dict: *Dict,
+            dict: *const Dict,
             key: ?Value = null,
 
             fn next(self: *Iter) ?[2]Value {
@@ -628,6 +661,17 @@ pub const Value = union(enum) {
                 return .{ key, value };
             }
         };
+
+        pub fn hash(self: *const Dict, hasher: *Hasher) void {
+            for (self.data) |maybe_obj| {
+                if (maybe_obj) |obj| {
+                    hasher.add(1);
+                    hasher.add(obj.hash);
+                } else {
+                    hasher.add(0);
+                }
+            }
+        }
     };
 
     pub const Lambda = struct {
@@ -659,6 +703,12 @@ pub const Value = union(enum) {
 
         pub fn write(_: *Lambda, writer: anytype) !void {
             try writer.print("<lambda>", .{});
+        }
+
+        pub fn hash(self: *const Lambda, hasher: *Hasher) void {
+            hasher.add(self.program.obj.hash);
+            hasher.add(self.offset);
+            for (self.stack) |value| hasher.add(value.hash());
         }
     };
 
@@ -697,10 +747,26 @@ pub const Value = union(enum) {
             try writeStr(self.content, writer);
         }
 
+        pub fn hash(self: *const Str, hasher: *Hasher) void {
+            for (self.content) |char| hasher.add(char);
+        }
+
         pub const Source = union(enum) {
             data: *Program,
             alloc,
             slice: *Str,
         };
+    };
+
+    pub const Hasher = struct {
+        const prime = 1099511628211;
+        const offset = 14695981039346656037;
+
+        hash: u64 = prime,
+
+        pub fn add(self: *Hasher, value: u64) void {
+            self.hash ^= value;
+            self.hash *|= offset;
+        }
     };
 };

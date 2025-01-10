@@ -239,6 +239,12 @@ pub const Runner = struct {
             .type = obj_type,
             .prev = self.last,
             .seen = false,
+            .hash = hash: {
+                var hasher = Value.Hasher{};
+                hasher.add(@intFromEnum(obj_type));
+                data.hash(&hasher);
+                break :hash hasher.hash;
+            },
         };
         self.last = &detail.obj;
         self.allocated += @sizeOf(obj_type.Detail()) + detail.allocated();
