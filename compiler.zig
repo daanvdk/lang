@@ -161,6 +161,9 @@ pub const Compiler = struct {
                         const info = try self.compileExpr(cols[i], .used);
 
                         if (!info.isList()) {
+                            try self.insertInstr(index, .{ .global = .list });
+                            index += 1;
+
                             while (index < self.instrs.items.len) : (index += 1) {
                                 switch (self.instrs.items[index]) {
                                     .local, .pop => |*j| {
@@ -171,13 +174,18 @@ pub const Compiler = struct {
                                 }
                             }
 
-                            try self.insertInstr(index, .{ .global = .list });
                             try self.instrs.append(.nil);
                             try self.instrs.append(.cons);
+                            try self.appendLocation(.{});
+                            try self.appendLocation(cols[i].location);
                             try self.instrs.append(.call);
                         }
                     },
                     else => {
+                        const location = Instr.Location.range(
+                            cols[i].location,
+                            cols[cols.len - 1].location,
+                        );
                         _ = try self.compileExpr(.{
                             .data = .{ .call = &.{
                                 .lhs = .{
@@ -186,10 +194,10 @@ pub const Compiler = struct {
                                 },
                                 .rhs = .{
                                     .data = .{ .list = cols[i..] },
-                                    .location = .{},
+                                    .location = location,
                                 },
                             } },
-                            .location = .{},
+                            .location = location,
                         }, .used);
                     },
                 }
@@ -219,6 +227,9 @@ pub const Compiler = struct {
                         const info = try self.compileExpr(cols[0], .used);
 
                         if (!info.isDict()) {
+                            try self.insertInstr(index, .{ .global = .dict });
+                            index += 1;
+
                             while (index < self.instrs.items.len) : (index += 1) {
                                 switch (self.instrs.items[index]) {
                                     .local, .pop => |*j| {
@@ -229,13 +240,18 @@ pub const Compiler = struct {
                                 }
                             }
 
-                            try self.insertInstr(index, .{ .global = .dict });
                             try self.instrs.append(.nil);
                             try self.instrs.append(.cons);
+                            try self.appendLocation(.{});
+                            try self.appendLocation(cols[0].location);
                             try self.instrs.append(.call);
                         }
                     },
                     else => {
+                        const location = Instr.Location.range(
+                            cols[0].location,
+                            cols[n - 1].location,
+                        );
                         _ = try self.compileExpr(.{
                             .data = .{ .call = &.{
                                 .lhs = .{
@@ -244,10 +260,10 @@ pub const Compiler = struct {
                                 },
                                 .rhs = .{
                                     .data = .{ .list = cols[0..n] },
-                                    .location = .{},
+                                    .location = location,
                                 },
                             } },
-                            .location = .{},
+                            .location = location,
                         }, .used);
                     },
                 }
@@ -620,15 +636,17 @@ pub const Compiler = struct {
                 return .any;
             },
             inline .@"for", .yield_all => |value, tag| {
-                std.debug.assert(self.is_gen);
+                if (tag == .yield_all) std.debug.assert(self.is_gen);
 
-                try self.instrs.append(.{ .global = .send });
-                try self.stack.push(null);
-                _ = try self.compileExpr(switch (tag) {
+                const subject: Expr = switch (tag) {
                     .@"for" => value.subject,
                     .yield_all => value.*,
                     else => unreachable,
-                }, .used);
+                };
+
+                try self.instrs.append(.{ .global = .send });
+                try self.stack.push(null);
+                _ = try self.compileExpr(subject, .used);
                 self.stack.pop();
                 try self.instrs.append(.null);
 
@@ -642,6 +660,8 @@ pub const Compiler = struct {
                     return .any;
                 }
 
+                try self.appendLocation(.{});
+                try self.appendLocation(subject.location);
                 try self.instrs.append(.call);
                 const start = self.stack.size();
                 try self.compilePattern(.{
@@ -653,7 +673,7 @@ pub const Compiler = struct {
                         .location = .{},
                     } } },
                     .location = .{},
-                }, .any, null, start, .{});
+                }, .any, null, start, subject.location);
                 self.stack.entries.shrinkRetainingCapacity(start);
                 try self.instrs.append(.{ .local = start + 1 });
                 try self.instrs.append(.null);
@@ -681,7 +701,7 @@ pub const Compiler = struct {
                                 .location = .{},
                             }} },
                             .location = .{},
-                        }, .any, null, start + 2, .{});
+                        }, .any, null, start + 2, expr.location);
                         self.stack.entries.shrinkRetainingCapacity(start + 2);
                     },
                     else => unreachable,
@@ -711,6 +731,56 @@ pub const Compiler = struct {
                 try self.instrs.append(.no_match);
                 return try self.compileExpr(.{
                     .data = .null,
+                    .location = .{},
+                }, usage);
+            },
+            .@"try" => |expr_ptr| {
+                return try self.compileExpr(.{
+                    .data = .{ .match = &.{
+                        .subject = expr_ptr.*,
+                        .matchers = &.{.{
+                            .pattern = .{
+                                .data = .{ .name = "@result" },
+                                .location = .{},
+                            },
+                            .expr = .{
+                                .data = .{ .match = &.{
+                                    .subject = .{
+                                        .data = .{ .name = "@result" },
+                                        .location = expr.location,
+                                    },
+                                    .matchers = &.{.{
+                                        .pattern = .{
+                                            .data = .{ .lists = &.{
+                                                .{
+                                                    .data = .{ .list = &.{
+                                                        .{
+                                                            .data = .{ .expr = &.{
+                                                                .data = .{ .str = "ok" },
+                                                                .location = .{},
+                                                            } },
+                                                            .location = .{},
+                                                        },
+                                                    } },
+                                                    .location = .{},
+                                                },
+                                                .{
+                                                    .data = .{ .name = "@details" },
+                                                    .location = .{},
+                                                },
+                                            } },
+                                            .location = .{},
+                                        },
+                                        .expr = .{
+                                            .data = .{ .name = "@details" },
+                                            .location = .{},
+                                        },
+                                    }},
+                                } },
+                                .location = .{},
+                            },
+                        }},
+                    } },
                     .location = .{},
                 }, usage);
             },
@@ -1208,40 +1278,42 @@ pub const Compiler = struct {
                     try self.compileNoMatch(true, to_next, start, 1, location);
                 }
 
-                // Check if long enough to start with prefix
-                try self.instrs.append(.{ .global = .len });
-                try self.instrs.append(.{ .local = self.stack.size() });
-                try self.instrs.append(.nil);
-                try self.instrs.append(.cons);
-                try self.instrs.append(.call);
-                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
-                try self.instrs.append(.ge);
-                try self.compileNoMatch(true, to_next, start, 1, location);
+                if (str.prefix.len > 0) {
+                    // Check if long enough to start with prefix
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                    try self.instrs.append(.ge);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
 
-                // Check if starts with prefix
-                try self.instrs.append(.{ .local = self.stack.size() });
-                try self.instrs.append(.{ .num = 0 });
-                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
-                try self.instrs.append(.slice);
-                try self.stack.push(null);
-                try self.stack.push(null);
-                _ = try self.compileExpr(.{
-                    .data = .{ .str = str.prefix },
-                    .location = .{},
-                }, .used);
-                self.stack.pop();
-                self.stack.pop();
-                try self.instrs.append(.eq);
-                try self.compileNoMatch(true, to_next, start, 1, location);
+                    // Check if starts with prefix
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.{ .num = 0 });
+                    try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                    try self.instrs.append(.slice);
+                    try self.stack.push(null);
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = str.prefix },
+                        .location = .{},
+                    }, .used);
+                    self.stack.pop();
+                    self.stack.pop();
+                    try self.instrs.append(.eq);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
 
-                // Slice off prefix
-                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
-                try self.instrs.append(.{ .global = .len });
-                try self.instrs.append(.{ .local = self.stack.size() });
-                try self.instrs.append(.nil);
-                try self.instrs.append(.cons);
-                try self.instrs.append(.call);
-                try self.instrs.append(.slice);
+                    // Slice off prefix
+                    try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.slice);
+                }
 
                 for (str.splits) |split| {
                     const curr = self.stack.size();
@@ -1330,6 +1402,11 @@ pub const Compiler = struct {
                             try self.instrs.append(.{ .pop = curr });
                         }
                     }
+                }
+
+                if (str.suffix.len == 0) {
+                    try self.compilePattern(str.last_pattern, .str, to_next, start, location);
+                    return;
                 }
 
                 // Check if long enough to end with suffix
@@ -1460,15 +1537,20 @@ pub const Compiler = struct {
     }
 
     fn appendLocation(self: *Compiler, location: Instr.Location) !void {
-        if (location.index == 0 and location.len == 0) return;
+        try self.insertLocation(self.instrs.items.len, location);
+    }
 
+    fn insertLocation(self: *Compiler, offset: usize, location: Instr.Location) !void {
         const locations = self.locations.items;
-        const offset = self.instrs.items.len;
-
+        const start = findIndex(Program.Location, locations, "offset", offset);
         var index: usize = 0;
-        while (index < locations.len and locations[locations.len - 1 - index].offset == offset) index += 1;
+        while (start + index < locations.len) : (index += 1) {
+            const next_location = locations[start + index];
+            if (next_location.offset != offset) break;
+            std.debug.assert(next_location.index == index);
+        }
 
-        try self.locations.append(.{
+        try self.locations.insert(start + index, .{
             .offset = offset,
             .index = index,
             .location = location,

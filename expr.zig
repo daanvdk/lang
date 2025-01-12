@@ -47,6 +47,7 @@ pub const Expr = struct {
         yield_all: *const Expr,
         @"return": *const Expr,
         assert: *const Expr,
+        @"try": *const Expr,
 
         module: []const Stmt,
     };

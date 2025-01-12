@@ -72,6 +72,8 @@ pub const Instr = union(enum) {
         list,
         dict,
         map,
+        flat,
+        flat_map,
         filter,
         reduce,
         count,
@@ -87,5 +89,11 @@ pub const Instr = union(enum) {
     pub const Location = packed struct {
         index: u32 = 0,
         len: u32 = 0,
+
+        pub fn range(self: Location, other: Location) Location {
+            const start = @min(self.index, other.index);
+            const end = @max(self.index + self.len, other.index + other.len);
+            return .{ .index = start, .len = end - start };
+        }
     };
 };

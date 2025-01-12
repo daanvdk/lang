@@ -230,7 +230,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseExpr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+    pub fn parseExpr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
         return self.parseOr(parse_type);
     }
 
@@ -542,6 +542,8 @@ pub const Parser = struct {
             return parse_type.fromExpr(try self.parseReturn());
         } else if (parse_type != .pattern and self.peek(&.{.assert})) {
             return parse_type.fromExpr(try self.parseAssert());
+        } else if (parse_type != .pattern and self.peek(&.{.@"try"})) {
+            return parse_type.fromExpr(try self.parseTry());
         } else {
             _ = try self.expect(&.{});
             unreachable;
@@ -1033,6 +1035,18 @@ pub const Parser = struct {
         return .{ .data = .{ .assert = expr }, .location = location };
     }
 
+    fn parseTry(self: *Parser) Error!Expr {
+        const start = self.getStart();
+        _ = try self.expect(&.{.@"try"});
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = try self.parseExpr(.expr);
+
+        const location = self.getLocation(start);
+        return .{ .data = .{ .@"try" = expr }, .location = location };
+    }
+
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
         const token = while (true) {
             if (self.token) |token| {
@@ -1083,7 +1097,7 @@ pub const Parser = struct {
         return token;
     }
 
-    fn expect(self: *Parser, token_types: []const Token.Type) !Token {
+    pub fn expect(self: *Parser, token_types: []const Token.Type) !Token {
         if (self.skip(token_types)) |token| return token;
 
         self.error_reason = .unexpected_token;
@@ -1602,6 +1616,7 @@ fn StrState(comptime parse_type: ParseType) type {
                     .last_pattern = self.last_pattern,
                     .suffix = suffix,
                 };
+                self.is_empty = true;
                 return .{ .str = str };
             }
         },

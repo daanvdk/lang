@@ -30,6 +30,7 @@ const stdlib = .{
         \\    iter(value)
         \\  end
         \\end
+        \\
     ),
     .next = (
         \\|iter| do
@@ -40,6 +41,7 @@ const stdlib = .{
         \\    [head, tail]
         \\  end
         \\end
+        \\
     ),
     .list = (
         \\|*iters| do
@@ -53,6 +55,7 @@ const stdlib = .{
         \\    list(*iters)
         \\  end
         \\end
+        \\
     ),
     .dict = (
         \\|*iters| do
@@ -65,6 +68,7 @@ const stdlib = .{
         \\    dict(target, *iters)
         \\  end
         \\end
+        \\
     ),
     .map = (
         \\|iter, f| do*
@@ -72,6 +76,23 @@ const stdlib = .{
         \\    yield f(item)
         \\  end
         \\end
+        \\
+    ),
+    .flat = (
+        \\|iter| do*
+        \\  for item in iter do
+        \\    yield* item
+        \\  end
+        \\end
+        \\
+    ),
+    .flat_map = (
+        \\|iter, f| do*
+        \\  for item in iter do
+        \\    yield* f(item)
+        \\  end
+        \\end
+        \\
     ),
     .filter = (
         \\|iter, f| do*
@@ -79,12 +100,14 @@ const stdlib = .{
         \\    if f(item) do yield item end
         \\  end
         \\end
+        \\
     ),
     .reduce = (
         \\|iter, f, acc| do
         \\  [head, tail] = next(iter) else return acc
         \\  reduce(tail, f, f(acc, head))
         \\end
+        \\
     ),
     .count = (
         \\|*args| match args do
@@ -97,6 +120,7 @@ const stdlib = .{
         \\  [start, stop] = count(start, stop, 1)
         \\  [stop] = count(0, stop, 1)
         \\end
+        \\
     ),
     .len = (
         \\|*args| match args do
@@ -106,9 +130,11 @@ const stdlib = .{
         \\  end
         \\  [iter] = len(iter, 0)
         \\end
+        \\
     ),
     .@"@dict_tail" = (
         \\|dict, key| |_| @dict_send(dict, key)
+        \\
     ),
     .index = (
         \\|iter, value, *args| do
@@ -126,10 +152,29 @@ const stdlib = .{
         \\    index(tail, value, acc + 1)
         \\  end
         \\end
+        \\
     ),
 };
 
 const Stdlib = @TypeOf(stdlib);
+
+const stdlib_len = len: {
+    var len: usize = 0;
+    for (std.meta.fieldNames(Stdlib)) |field| {
+        len += @field(stdlib, field).len;
+    }
+    break :len len;
+};
+const stdlib_content: [stdlib_len]u8 = content: {
+    var content: [stdlib_len]u8 = undefined;
+    var index = 0;
+    for (std.meta.fieldNames(Stdlib)) |field| {
+        const chunk = @field(stdlib, field);
+        @memcpy(content[index .. index + chunk.len], chunk);
+        index += chunk.len;
+    }
+    break :content content;
+};
 
 const StdlibOffsets = offsets: {
     const stdfields = @typeInfo(Stdlib).Struct.fields;
@@ -217,6 +262,10 @@ pub const Runner = struct {
     }
 
     fn compileStdlib(allocator: std.mem.Allocator) !struct { offsets: StdlibOffsets, program: Program } {
+        var parser = Parser.init(allocator, &stdlib_content);
+        parser.lexer.internal = true;
+        parser.skip_newlines = true;
+
         var buffer = Buffer.init(allocator);
         defer buffer.deinit();
 
@@ -226,8 +275,7 @@ pub const Runner = struct {
         var offsets: StdlibOffsets = undefined;
         inline for (@typeInfo(Stdlib).Struct.fields) |field| {
             @field(offsets, field.name) = compiler.instrs.items.len;
-            const content = @field(stdlib, field.name);
-            const expr = internal_parse(allocator, content) catch |err| {
+            const expr = parser.parseExpr(.expr) catch |err| {
                 std.debug.print("{s}\n", .{@errorName(err)});
                 return error.RunError;
             };
@@ -237,6 +285,10 @@ pub const Runner = struct {
                 return error.RunError;
             };
         }
+        _ = parser.expect(&.{.eof}) catch |err| {
+            std.debug.print("{s}\n", .{@errorName(err)});
+            return error.RunError;
+        };
 
         const data = try buffer.content.toOwnedSlice();
         errdefer allocator.free(data);
@@ -923,9 +975,9 @@ pub const Runner = struct {
             .builtin => |builtin| .{ .builtin = builtin },
             .obj => |obj| switch (obj.type) {
                 .lambda => .{ .lambda = @fieldParentPtr("obj", obj) },
-                else => self.runError(spec, "RunError: expected a lambda function\n", .{}),
+                else => self.runError(spec, "RunError: expected a function\n", .{}),
             },
-            else => self.runError(spec, "RunError: expected a lambda function\n", .{}),
+            else => self.runError(spec, "RunError: expected a function\n", .{}),
         };
     }
 
@@ -975,22 +1027,32 @@ pub const Runner = struct {
                 std.debug.print("\x1b[2m...some calls were optimized out by tail call optimization...\x1b[0m\n\n", .{});
             }
             if (call.location.index == 0 and call.location.len == 0) {
+                std.debug.print("\x1b[2mFile \x1b[0;1;34m{s}\x1b[0;2m missing location info\x1b[0m\n\n", .{call.program.path});
                 continue;
             }
 
-            const file = std.fs.cwd().openFile(call.program.path, .{}) catch continue;
-            defer file.close();
+            const is_stdlib = std.mem.eql(u8, call.program.path, "<stdlib>");
 
-            const content = std.posix.mmap(
-                null,
-                (file.metadata() catch continue).size(),
-                std.posix.PROT.READ,
-                .{ .TYPE = .SHARED },
-                file.handle,
-                0,
-            ) catch continue;
-            defer std.posix.munmap(content);
+            var file: std.fs.File = undefined;
+            var mmap_content: []align(std.mem.page_size) const u8 = undefined;
+            if (!is_stdlib) {
+                file = std.fs.cwd().openFile(call.program.path, .{}) catch continue;
+                errdefer file.close();
+                mmap_content = std.posix.mmap(
+                    null,
+                    (file.metadata() catch continue).size(),
+                    std.posix.PROT.READ,
+                    .{ .TYPE = .SHARED },
+                    file.handle,
+                    0,
+                ) catch continue;
+            }
+            defer if (!is_stdlib) {
+                file.close();
+                std.posix.munmap(mmap_content);
+            };
 
+            const content: []const u8 = if (is_stdlib) &stdlib_content else mmap_content;
             var line: usize = 1;
             var line_start: usize = 0;
             for (0.., content[0..call.location.index]) |index, char| {
@@ -1014,7 +1076,7 @@ pub const Runner = struct {
 
                 const mark_start = @max(line_start, start);
                 const mark_end = @min(line_end, end);
-                std.debug.print("  {s}\x1b[1;31m{s}\x1b[0m{s}\n\n", .{
+                std.debug.print("  {s}\x1b[4:3m\x1b[58;5;1m{s}\x1b[0m{s}\n\n", .{
                     content[line_start..mark_start],
                     content[mark_start..mark_end],
                     content[mark_end..line_end],

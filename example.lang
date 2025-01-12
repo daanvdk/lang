@@ -1,9 +1,53 @@
-fn eval(expr) match expr do
-  "${lhs}+${rhs}" = eval(lhs) + eval(rhs)
-  "${lhs}*${rhs}" = eval(lhs) * eval(rhs)
-  _               = num(expr)
+pub fn parse(source) do
+  parse_node(source, 0, [], [], null)
+end
+
+fn parse_node(source, index, alt, seq, group_start) do
+  [char, source] = next(source) else return if group_start == null do
+    ["ok", to_result(alt, seq)]
+  else
+    ["err", "${group_start}: unmatched left parenthesis"]
+  end
+
+  [node, source, index] = parse_suffix(*match char do
+    "|" = return parse_node(source, index + 1, [*alt, seq], [], group_start)
+    "(" = try parse_node(source, index + 1, [], [], index)
+    ")" = return if group_start == null do
+      ["err", "${index}: unmatched right parenthesis"]
+    else
+      ["ok", to_result(alt, seq), source, index + 1]
+    end
+    _ = [["chr", char], source, index + 1]
+  end)
+
+  parse_node(source, index, alt, [*seq, node], group_start)
+end
+
+fn parse_suffix(node, source, index) match source do
+  "?${source}" = parse_suffix(["qnt", 0, 1, node], source, index + 1)
+  "*${source}" = parse_suffix(["qnt", 0, null, node], source, index + 1)
+  "+${source}" = parse_suffix(["qnt", 1, null, node], source, index + 1)
+  _            = [node, source, index]
+end
+
+fn to_result(alt, seq) [*alt, seq]->map(to_seq)->to_alt()
+fn to_seq(nodes) to_agg("seq", nodes)
+fn to_alt(nodes) to_agg("alt", nodes)
+
+fn to_agg(tag, nodes) do
+  match nodes->flat_map(|node| from_agg(tag, node))->list() do
+    [node]   = node
+    nodes = [tag, *nodes]
+  end
+end
+
+fn from_agg(tag, node) do
+  match node do
+    [(tag), *nodes] = nodes
+    _               = [node]
+  end
 end
 
 pub fn main() do
-  print(eval("4*5+2*3+7"))
+  print(parse("foo(bar|baz)*"))
 end

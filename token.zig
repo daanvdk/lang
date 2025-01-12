@@ -53,6 +53,7 @@ pub const Token = struct {
         yield,
         @"return",
         assert,
+        @"try",
 
         @"pub",
         @"fn",
