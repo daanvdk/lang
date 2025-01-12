@@ -1,5 +1,9 @@
-{fib} = import("./fib")
+fn eval(expr) match expr do
+  "${lhs}+${rhs}" = eval(lhs) + eval(rhs)
+  "${lhs}*${rhs}" = eval(lhs) * eval(rhs)
+  _               = num(expr)
+end
 
 pub fn main() do
-  print(fib(10))
+  print(eval("4*5+2*3+7"))
 end

@@ -110,6 +110,23 @@ const stdlib = .{
     .@"@dict_tail" = (
         \\|dict, key| |_| @dict_send(dict, key)
     ),
+    .index = (
+        \\|iter, value, *args| do
+        \\  acc = match args do
+        \\    [acc] = acc
+        \\    []    = 0
+        \\  end
+        \\  if is_str(iter) and acc == 0 do
+        \\    return @str_index(iter, value)
+        \\  end
+        \\  [head, tail] = next(iter) else return null
+        \\  if head == value do
+        \\    acc
+        \\  else
+        \\    index(tail, value, acc + 1)
+        \\  end
+        \\end
+    ),
 };
 
 const Stdlib = @TypeOf(stdlib);
@@ -596,28 +613,89 @@ pub const Runner = struct {
                 .get => {
                     const rhs = call.stack.pop();
                     const lhs = call.stack.pop();
-                    try call.stack.append(self.allocator, if (lhs.toStr()) |content| char: {
-                        const index = try self.expectIndex(.{ ip, 1 }, rhs);
-                        var offset: usize = 0;
-                        for (0..index) |_| {
-                            offset += initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
-                        }
-                        const len = initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
-                        break :char try self.strSlice(lhs, content[offset .. offset + len]);
-                    } else switch (lhs) {
-                        .obj => |obj| switch (obj.type) {
-                            .cons => get: {
-                                const index = try self.expectIndex(.{ ip, 1 }, rhs);
-                                var cons = Value.ObjType.cons.detailed(obj);
-                                for (0..index) |_| {
-                                    cons = cons.tail orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
-                                }
-                                break :get cons.head;
-                            },
-                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return self.runError(.{ ip, 1 }, "RunError: key not found: {}\n", .{rhs}),
-                            else => return self.runError(.{ ip, 0 }, "RunError: expected an indexable value\n", .{}),
+
+                    const indexable = try self.expectIndexable(.{ ip, 0 }, &lhs);
+
+                    try call.stack.append(self.allocator, switch (indexable) {
+                        .str => |content| get: {
+                            const index = try self.expectIndex(.{ ip, 1 }, rhs);
+                            var offset: usize = 0;
+                            for (0..index) |_| {
+                                offset += initCharLen(content[offset..]) orelse {
+                                    return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
+                                };
+                            }
+                            const len = initCharLen(content[offset..]) orelse {
+                                return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
+                            };
+                            break :get try self.strSlice(lhs, content[offset .. offset + len]);
                         },
-                        else => return self.runError(.{ ip, 0 }, "RunError: expected an indexable value\n", .{}),
+                        .list => |list| get: {
+                            const index = try self.expectIndex(.{ ip, 1 }, rhs);
+                            var cons = list orelse {
+                                return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
+                            };
+                            for (0..index) |_| {
+                                cons = cons.tail orelse {
+                                    return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
+                                };
+                            }
+                            break :get cons.head;
+                        },
+                        .dict => |dict| dict.get(rhs) orelse {
+                            return self.runError(.{ ip, 1 }, "RunError: key not found: {}\n", .{rhs});
+                        },
+                    });
+                },
+                .slice => {
+                    const rhs = call.stack.pop();
+                    const mhs = call.stack.pop();
+                    const lhs = call.stack.pop();
+
+                    const sliceable = try self.expectSliceable(.{ ip, 0 }, &lhs);
+                    const start = try self.expectIndex(.{ ip, 1 }, mhs);
+                    const end = try self.expectIndex(.{ ip, 2 }, rhs);
+                    if (end < start) return self.runError(.{ ip, 2 }, "RunError: end ({}) before start ({})\n", .{ end, start });
+
+                    try call.stack.append(self.allocator, switch (sliceable) {
+                        .str => |content| slice: {
+                            var start_offset: usize = 0;
+                            for (0..start) |_| {
+                                start_offset += initCharLen(content[start_offset..]) orelse {
+                                    return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{start});
+                                };
+                            }
+
+                            var end_offset: usize = start_offset;
+                            for (start..end) |_| {
+                                end_offset += initCharLen(content[end_offset..]) orelse {
+                                    return self.runError(.{ ip, 2 }, "RunError: index out of bounds: {}\n", .{end});
+                                };
+                            }
+
+                            break :slice try self.strSlice(lhs, content[start_offset..end_offset]);
+                        },
+                        .list => |init_list| slice: {
+                            var list = init_list;
+                            for (0..start) |_| {
+                                const cons = list orelse {
+                                    return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{start});
+                                };
+                                list = cons.tail;
+                            }
+
+                            var items = std.ArrayList(Value).init(self.allocator);
+                            defer items.deinit();
+                            for (start..end) |_| {
+                                const cons = list orelse {
+                                    return self.runError(.{ ip, 2 }, "RunError: index out of bounds: {}\n", .{end});
+                                };
+                                try items.append(cons.head);
+                                list = cons.tail;
+                            }
+
+                            break :slice try self.createListValue(items.items);
+                        },
                     });
                 },
 
@@ -851,6 +929,46 @@ pub const Runner = struct {
         };
     }
 
+    pub fn expectIndexable(self: *Runner, spec: ?LocationSpec, value: *const Value) Error!Indexable {
+        return switch (value.*) {
+            .str => |*short| .{ .str = Value.fromShort(short) },
+            .nil => .{ .list = null },
+            .obj => |obj| switch (obj.type) {
+                .str => .{ .str = Value.ObjType.str.detailed(obj).content },
+                .cons => .{ .list = @fieldParentPtr("obj", obj) },
+                .dict => .{ .dict = @fieldParentPtr("obj", obj) },
+                else => self.runError(spec, "RunError: expected an indexable value\n", .{}),
+            },
+            else => self.runError(spec, "RunError: expected an indexable value\n", .{}),
+        };
+    }
+
+    pub fn expectSliceable(self: *Runner, spec: ?LocationSpec, value: *const Value) Error!Sliceable {
+        return switch (value.*) {
+            .str => |*short| .{ .str = Value.fromShort(short) },
+            .nil => .{ .list = null },
+            .obj => |obj| switch (obj.type) {
+                .str => .{ .str = Value.ObjType.str.detailed(obj).content },
+                .cons => .{ .list = @fieldParentPtr("obj", obj) },
+                else => self.runError(spec, "RunError: expected a sliceable value\n", .{}),
+            },
+            else => self.runError(spec, "RunError: expected a sliceable value\n", .{}),
+        };
+    }
+
+    pub fn expectNummable(self: *Runner, spec: ?LocationSpec, value: *const Value) Error!Nummable {
+        return switch (value.*) {
+            .num => |value_| .{ .num = value_ },
+            .bool => |value_| .{ .bool = value_ },
+            .str => |*short| .{ .str = Value.fromShort(short) },
+            .obj => |obj| switch (obj.type) {
+                .str => .{ .str = Value.ObjType.str.detailed(obj).content },
+                else => self.runError(spec, "RunError: expected a nummable value\n", .{}),
+            },
+            else => self.runError(spec, "RunError: expected a nummable value\n", .{}),
+        };
+    }
+
     pub fn printStackTrace(self: *Runner) void {
         for (self.calls.items) |call| {
             if (call.is_tail_call) {
@@ -911,6 +1029,23 @@ pub const Runner = struct {
     const Callable = union(enum) {
         builtin: *const fn (*Runner, ?*Value.Cons) anyerror!Value,
         lambda: *Value.Lambda,
+    };
+
+    const Indexable = union(enum) {
+        str: []const u8,
+        list: ?*Value.Cons,
+        dict: *Value.Dict,
+    };
+
+    const Sliceable = union(enum) {
+        str: []const u8,
+        list: ?*Value.Cons,
+    };
+
+    const Nummable = union(enum) {
+        num: f64,
+        bool: bool,
+        str: []const u8,
     };
 
     pub const Call = struct {
@@ -993,6 +1128,22 @@ pub const Runner = struct {
                 .obj => |obj| obj.type == .lambda,
                 else => false,
             } };
+        }
+
+        fn num(self: *Runner, args: ?*Value.Cons) anyerror!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .num = switch (try self.expectNummable(null, &arg)) {
+                .num => |value| value,
+                .bool => |value| if (value) 1 else 0,
+                .str => |content| std.fmt.parseFloat(f64, content) catch {
+                    return self.runError(null, "RunError: cannot parse as num: {s}\n", .{content});
+                },
+            } };
+        }
+
+        fn @"bool"(_: *Runner, args: ?*Value.Cons) anyerror!Value {
+            const arg = try Value.Cons.expectOne(args);
+            return .{ .bool = arg.truthy() };
         }
 
         fn str(self: *Runner, args: ?*Value.Cons) anyerror!Value {
@@ -1116,6 +1267,20 @@ pub const Runner = struct {
                 tail = .null;
             }
             return try self.createListValue(&.{ head, tail });
+        }
+
+        fn @"@str_index"(self: *Runner, args: ?*Value.Cons) anyerror!Value {
+            const args_ = try Value.Cons.expectN(args, 2);
+            var haystack = try self.expectStr(null, &args_[0]);
+            const needle = try self.expectStr(null, &args_[1]);
+
+            var index: f64 = 0;
+            while (needle.len <= haystack.len) : (index += 1) {
+                if (std.mem.startsWith(u8, haystack, needle)) return .{ .num = index };
+                const offset = initCharLen(haystack) orelse break;
+                haystack = haystack[offset..];
+            }
+            return .null;
         }
 
         fn import(self: *Runner, args: ?*Value.Cons) anyerror!Value {

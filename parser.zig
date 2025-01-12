@@ -480,14 +480,25 @@ pub const Parser = struct {
                 self.skip_newlines = true;
 
                 errdefer lhs.deinit(self.allocator);
-                const rhs = try self.parseExpr(.expr);
-                errdefer rhs.deinit(self.allocator);
-                _ = try self.expect(&.{.rlist});
+                const mhs = try self.parseExpr(.expr);
+                errdefer mhs.deinit(self.allocator);
 
-                const bin = try self.allocator.create(Expr.Bin);
-                bin.* = .{ .lhs = lhs, .rhs = rhs };
-                const location = self.getLocation(start);
-                lhs = .{ .data = .{ .get = bin }, .location = location };
+                if (self.skip(&.{.slice}) != null) {
+                    const rhs = try self.parseExpr(.expr);
+                    errdefer rhs.deinit(self.allocator);
+
+                    _ = try self.expect(&.{.rlist});
+                    const tri = try self.allocator.create(Expr.Tri);
+                    tri.* = .{ .lhs = lhs, .mhs = mhs, .rhs = rhs };
+                    const location = self.getLocation(start);
+                    lhs = .{ .data = .{ .slice = tri }, .location = location };
+                } else {
+                    _ = try self.expect(&.{.rlist});
+                    const bin = try self.allocator.create(Expr.Bin);
+                    bin.* = .{ .lhs = lhs, .rhs = mhs };
+                    const location = self.getLocation(start);
+                    lhs = .{ .data = .{ .get = bin }, .location = location };
+                }
             } else {
                 break;
             }
@@ -506,7 +517,7 @@ pub const Parser = struct {
         } else if (self.peek(&.{.null})) {
             return try parse_type.fromLit(self.allocator, try self.parseNull());
         } else if (self.peek(&.{.str})) {
-            return try parse_type.fromLit(self.allocator, try self.parseStr());
+            return try self.parseStr(parse_type);
         } else if (parse_type != .expr and self.peek(&.{.ignore})) {
             return parse_type.fromPattern(try self.parseIgnore());
         } else if (self.peek(&.{.llist})) {
@@ -580,63 +591,71 @@ pub const Parser = struct {
         return .{ .data = .null, .location = location };
     }
 
-    fn parseStr(self: *Parser) Error!Expr {
+    fn parseStr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
         const start = self.getStart();
         _ = try self.expect(&.{.str});
+        var state = StrState(parse_type).init(self.allocator);
+        defer state.deinit();
+        return try self.parseStrTail(parse_type, &state, start);
+    }
 
-        var exprs = std.ArrayList(Expr).init(self.allocator);
-        defer {
-            for (exprs.items) |expr| expr.deinit(self.allocator);
-            exprs.deinit();
-        }
-
+    fn parseStrTail(self: *Parser, comptime parse_type: ParseType, state: *StrState(parse_type), start: usize) Error!parse_type.Result() {
         while (true) {
             const chunk_start = self.lexer.index;
             const chunk = try self.lexer.strChunk(self.allocator);
             const chunk_end = self.lexer.index - @as(usize, if (chunk.expr) 2 else 1);
+            const chunk_location = Instr.Location{
+                .index = @truncate(chunk_start),
+                .len = @truncate(chunk_end - chunk_start),
+            };
             self.last_index = self.lexer.index;
 
-            if (!chunk.expr and exprs.items.len == 0) {
+            if (chunk.expr) {
+                const result: parse_type.Result() = result: {
+                    errdefer self.allocator.free(chunk.content);
+
+                    const old_skip = self.skip_newlines;
+                    defer self.skip_newlines = old_skip;
+                    self.skip_newlines = true;
+
+                    const result = try self.parseExpr(parse_type);
+                    errdefer result.deinit(self.allocator);
+                    _ = try self.expect(&.{.rdict});
+
+                    break :result result;
+                };
+
+                switch (parse_type) {
+                    .expr, .pattern => try state.append(chunk.content, chunk_location, result),
+                    .both => switch (result.detail()) {
+                        .expr => |expr| {
+                            var expr_state = state.toExpr();
+                            try expr_state.append(chunk.content, chunk_location, expr);
+                            return parse_type.fromExpr(try self.parseStrTail(.expr, &expr_state, start));
+                        },
+                        .pattern => |pattern| {
+                            var pattern_state = state.toPattern();
+                            try pattern_state.append(chunk.content, chunk_location, pattern);
+                            return parse_type.fromPattern(try self.parseStrTail(.pattern, &pattern_state, start));
+                        },
+                        .both => |both| try state.append(chunk.content, chunk_location, both),
+                    },
+                }
+            } else if (state.isEmpty()) {
                 const location = self.getLocation(start);
-                return .{
+                const expr = .{
                     .data = .{ .str = chunk.content },
                     .location = location,
                 };
-            }
-
-            if (chunk.content.len > 0) {
-                errdefer self.allocator.free(chunk.content);
-                try exprs.append(.{
-                    .data = .{ .str = chunk.content },
-                    .location = .{
-                        .index = @truncate(chunk_start),
-                        .len = @truncate(chunk_end - chunk_start),
-                    },
-                });
+                return try parse_type.fromLit(self.allocator, expr);
             } else {
-                self.allocator.free(chunk.content);
+                const location = self.getLocation(start);
+                return .{
+                    .data = try state.toResult(chunk.content, chunk_location),
+                    .location = location,
+                };
             }
-
-            if (!chunk.expr) break;
-
-            const old_skip = self.skip_newlines;
-            defer self.skip_newlines = old_skip;
-            self.skip_newlines = true;
-
-            const expr = try self.parseExpr(.expr);
-            errdefer expr.deinit(self.allocator);
-            _ = try self.expect(&.{.rdict});
-            try exprs.append(expr);
         }
-
-        const location = self.getLocation(start);
-        const call = try self.allocator.create(Expr.Bin);
-        errdefer self.allocator.destroy(call);
-        call.* = .{
-            .lhs = .{ .data = .{ .global = .str }, .location = .{} },
-            .rhs = .{ .data = .{ .list = try exprs.toOwnedSlice() }, .location = location },
-        };
-        return .{ .data = .{ .call = call }, .location = location };
     }
 
     fn parseIgnore(self: *Parser) Error!Pattern {
@@ -921,8 +940,8 @@ pub const Parser = struct {
             expr = .{
                 .data = switch (branch.cond) {
                     .@"if" => |cond| data: {
-                        const if_ = try self.allocator.create(Expr.If);
-                        if_.* = .{ .cond = cond, .then = branch.then, .else_ = expr };
+                        const if_ = try self.allocator.create(Expr.Tri);
+                        if_.* = .{ .lhs = cond, .mhs = branch.then, .rhs = expr };
                         break :data .{ .@"if" = if_ };
                     },
                     .match => |cond| data: {
@@ -1475,6 +1494,184 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
             }
             return if (parse_type == .both) .{ .both = result } else result;
         }
+    };
+}
+
+fn StrState(comptime parse_type: ParseType) type {
+    return switch (parse_type) {
+        .expr => struct {
+            const Self = @This();
+
+            exprs: std.ArrayList(Expr),
+
+            fn init(allocator: std.mem.Allocator) Self {
+                return .{ .exprs = std.ArrayList(Expr).init(allocator) };
+            }
+
+            fn deinit(self: *Self) void {
+                self.exprs.deinit();
+            }
+
+            fn isEmpty(self: *Self) bool {
+                return self.exprs.items.len == 0;
+            }
+
+            fn append(self: *Self, prefix: []const u8, prefix_location: Instr.Location, item: Expr) !void {
+                errdefer item.deinit(self.exprs.allocator);
+                try self.appendChunk(prefix, prefix_location);
+                try self.exprs.append(item);
+            }
+
+            fn toResult(self: *Self, suffix: []const u8, suffix_location: Instr.Location) !Expr.Data {
+                try self.appendChunk(suffix, suffix_location);
+                const bin = try self.exprs.allocator.create(Expr.Bin);
+                errdefer self.exprs.allocator.destroy(bin);
+                bin.* = .{
+                    .lhs = .{
+                        .data = .{ .global = .str },
+                        .location = .{},
+                    },
+                    .rhs = .{
+                        .data = .{ .list = try self.exprs.toOwnedSlice() },
+                        .location = .{},
+                    },
+                };
+                return .{ .call = bin };
+            }
+
+            fn appendChunk(self: *Self, chunk: []const u8, chunk_location: Instr.Location) !void {
+                if (chunk.len == 0) {
+                    self.exprs.allocator.free(chunk);
+                } else {
+                    errdefer self.exprs.allocator.free(chunk);
+                    try self.exprs.append(.{
+                        .data = .{ .str = chunk },
+                        .location = chunk_location,
+                    });
+                }
+            }
+        },
+        .pattern => struct {
+            const Self = @This();
+
+            is_empty: bool = true,
+            prefix: []const u8 = undefined,
+            splits: std.ArrayList(Pattern.StrSplit),
+            last_pattern: Pattern = undefined,
+
+            fn init(allocator: std.mem.Allocator) Self {
+                return .{ .splits = std.ArrayList(Pattern.StrSplit).init(allocator) };
+            }
+
+            fn deinit(self: *Self) void {
+                self.splits.deinit();
+                if (!self.is_empty) {
+                    self.splits.allocator.free(self.prefix);
+                    self.last_pattern.deinit(self.splits.allocator);
+                }
+            }
+
+            fn isEmpty(self: *Self) bool {
+                return self.is_empty;
+            }
+
+            fn append(self: *Self, prefix: []const u8, _: Instr.Location, item: Pattern) !void {
+                if (self.is_empty) {
+                    self.is_empty = false;
+                    self.prefix = prefix;
+                } else {
+                    errdefer {
+                        self.splits.allocator.free(prefix);
+                        item.deinit(self.splits.allocator);
+                    }
+                    try self.splits.append(.{
+                        .pattern = self.last_pattern,
+                        .separator = prefix,
+                    });
+                }
+                self.last_pattern = item;
+            }
+
+            fn toResult(self: *Self, suffix: []const u8, _: Instr.Location) !Pattern.Data {
+                errdefer self.splits.allocator.free(suffix);
+                const str = try self.splits.allocator.create(Pattern.Str);
+                errdefer self.splits.allocator.destroy(str);
+                str.* = .{
+                    .prefix = self.prefix,
+                    .splits = try self.splits.toOwnedSlice(),
+                    .last_pattern = self.last_pattern,
+                    .suffix = suffix,
+                };
+                return .{ .str = str };
+            }
+        },
+        .both => struct {
+            allocator: std.mem.Allocator,
+            expr: StrState(.expr),
+            pattern: StrState(.pattern),
+
+            const Self = @This();
+
+            fn init(allocator: std.mem.Allocator) Self {
+                return .{
+                    .allocator = allocator,
+                    .expr = StrState(.expr).init(allocator),
+                    .pattern = StrState(.pattern).init(allocator),
+                };
+            }
+
+            fn deinit(self: *Self) void {
+                self.expr.deinit();
+                self.pattern.deinit();
+            }
+
+            fn toExpr(self: *Self) StrState(.expr) {
+                self.pattern.deinit();
+                return self.expr;
+            }
+
+            fn toPattern(self: *Self) StrState(.pattern) {
+                self.expr.deinit();
+                return self.pattern;
+            }
+
+            fn isEmpty(self: *Self) bool {
+                const is_empty = self.expr.isEmpty();
+                std.debug.assert(is_empty == self.pattern.isEmpty());
+                return is_empty;
+            }
+
+            fn append(self: *Self, prefix: []const u8, prefix_location: Instr.Location, item: Both) !void {
+                const prefix_copy = self.allocator.dupe(u8, prefix) catch |err| {
+                    self.allocator.free(prefix);
+                    item.deinit(self.allocator);
+                    return err;
+                };
+                self.expr.append(prefix, prefix_location, item.expr()) catch |err| {
+                    self.allocator.free(prefix_copy);
+                    item.pattern().deinit(self.allocator);
+                    return err;
+                };
+                try self.pattern.append(prefix_copy, prefix_location, item.pattern());
+            }
+
+            fn toResult(self: *Self, suffix: []const u8, suffix_location: Instr.Location) !ParseResult.Data {
+                const suffix_copy = self.allocator.dupe(u8, suffix) catch |err| {
+                    self.allocator.free(suffix);
+                    return err;
+                };
+                const expr = self.expr.toResult(suffix, suffix_location) catch |err| {
+                    self.allocator.free(suffix_copy);
+                    return err;
+                };
+                errdefer (Expr{ .data = expr, .location = .{} }).deinit(self.allocator);
+                const pattern = try self.pattern.toResult(suffix_copy, suffix_location);
+                return .{ .both = .{
+                    .expr = expr,
+                    .pattern = pattern,
+                } };
+            }
+        },
     };
 }
 

@@ -23,6 +23,7 @@ pub const Expr = struct {
 
         call: *const Bin,
         get: *const Bin,
+        slice: *const Tri,
 
         pow: *const Bin,
         pos: *const Expr,
@@ -39,7 +40,7 @@ pub const Expr = struct {
         @"or": *const Bin,
 
         match: *const Match,
-        @"if": *const If,
+        @"if": *const Tri,
         @"for": *const For,
         gen: *const Expr,
         yield: *const Expr,
@@ -274,29 +275,29 @@ pub const Expr = struct {
         }
     };
 
-    pub const If = struct {
-        cond: Expr,
-        then: Expr,
-        else_: Expr,
+    pub const Tri = struct {
+        lhs: Expr,
+        mhs: Expr,
+        rhs: Expr,
 
-        pub fn deinit(self: If, allocator: std.mem.Allocator) void {
-            self.cond.deinit(allocator);
-            self.then.deinit(allocator);
-            self.else_.deinit(allocator);
+        pub fn deinit(self: Tri, allocator: std.mem.Allocator) void {
+            self.lhs.deinit(allocator);
+            self.mhs.deinit(allocator);
+            self.rhs.deinit(allocator);
         }
 
-        pub fn clone(self: If, allocator: std.mem.Allocator) std.mem.Allocator.Error!If {
-            var copy: If = undefined;
-            copy.cond = try self.cond.clone(allocator);
-            errdefer copy.cond.deinit(allocator);
-            copy.then = try self.then.clone(allocator);
-            errdefer copy.then.deinit(allocator);
-            copy.else_ = try self.else_.clone(allocator);
+        pub fn clone(self: Tri, allocator: std.mem.Allocator) std.mem.Allocator.Error!Tri {
+            var copy: Tri = undefined;
+            copy.lhs = try self.lhs.clone(allocator);
+            errdefer copy.lhs.deinit(allocator);
+            copy.mhs = try self.mhs.clone(allocator);
+            errdefer copy.mhs.deinit(allocator);
+            copy.rhs = try self.rhs.clone(allocator);
             return copy;
         }
 
-        pub fn usesName(self: If, name: []const u8) bool {
-            return self.cond.usesName(name) or self.then.usesName(name) or self.else_.usesName(name);
+        pub fn usesName(self: Tri, name: []const u8) bool {
+            return self.lhs.usesName(name) or self.mhs.usesName(name) or self.rhs.usesName(name);
         }
     };
 

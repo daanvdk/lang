@@ -118,6 +118,7 @@ pub const Lexer = struct {
             '(' => return .lpar,
             ')' => return .rpar,
             '.' => return .dot,
+            ':' => return .slice,
 
             '^' => return .pow,
             '*' => return .mul,

@@ -135,7 +135,7 @@ pub const Compiler = struct {
                     } });
                 }
                 try self.compileUsage(usage);
-                return .any;
+                return .str;
             },
             inline .list, .lists => |value, tag| {
                 const cols: []const Expr = switch (tag) {
@@ -345,7 +345,7 @@ pub const Compiler = struct {
                 return .any;
             },
             inline .call, .get, .pow, .mul, .div, .add, .sub => |bin, tag| {
-                _ = try self.compileExpr(bin.lhs, .used);
+                const lhs_info = try self.compileExpr(bin.lhs, .used);
                 try self.stack.push(null);
                 _ = try self.compileExpr(bin.rhs, .used);
                 self.stack.pop();
@@ -357,7 +357,22 @@ pub const Compiler = struct {
                     try self.instrs.append(@field(Instr, @tagName(tag)));
                     try self.compileUsage(usage);
                 }
-                return .any;
+                return if (tag == .get and lhs_info == .str) .str else .any;
+            },
+            inline .slice => |tri, tag| {
+                const lhs_info = try self.compileExpr(tri.lhs, .used);
+                try self.stack.push(null);
+                _ = try self.compileExpr(tri.mhs, .used);
+                try self.stack.push(null);
+                _ = try self.compileExpr(tri.rhs, .used);
+                self.stack.pop();
+                self.stack.pop();
+                try self.appendLocation(tri.lhs.location);
+                try self.appendLocation(tri.mhs.location);
+                try self.appendLocation(tri.rhs.location);
+                try self.instrs.append(@field(Instr, @tagName(tag)));
+                try self.compileUsage(usage);
+                return if (lhs_info == .str) .str else .any;
             },
             inline .pos, .neg, .not => |expr_ptr, tag| {
                 _ = try self.compileExpr(expr_ptr.*, .used);
@@ -565,15 +580,15 @@ pub const Compiler = struct {
 
                 return info;
             },
-            .@"if" => |if_| {
-                _ = try self.compileExpr(if_.cond, .used);
+            .@"if" => |tri| {
+                _ = try self.compileExpr(tri.lhs, .used);
                 try self.instrs.append(.null);
 
                 const else_index = self.instrs.items.len;
-                const else_info = try self.compileExpr(if_.else_, usage);
+                const else_info = try self.compileExpr(tri.rhs, usage);
 
                 var then_index = self.instrs.items.len;
-                const then_info = try self.compileExpr(if_.then, usage);
+                const then_info = try self.compileExpr(tri.mhs, usage);
 
                 const then_len = self.instrs.items.len - then_index;
                 if (then_len > 0 and usage != .returned) {
@@ -1183,6 +1198,215 @@ pub const Compiler = struct {
                     else => unreachable,
                 }
             },
+            .str => |str| {
+                if (!info.isStr()) {
+                    try self.instrs.append(.{ .global = .is_str });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
+                }
+
+                // Check if long enough to start with prefix
+                try self.instrs.append(.{ .global = .len });
+                try self.instrs.append(.{ .local = self.stack.size() });
+                try self.instrs.append(.nil);
+                try self.instrs.append(.cons);
+                try self.instrs.append(.call);
+                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                try self.instrs.append(.ge);
+                try self.compileNoMatch(true, to_next, start, 1, location);
+
+                // Check if starts with prefix
+                try self.instrs.append(.{ .local = self.stack.size() });
+                try self.instrs.append(.{ .num = 0 });
+                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                try self.instrs.append(.slice);
+                try self.stack.push(null);
+                try self.stack.push(null);
+                _ = try self.compileExpr(.{
+                    .data = .{ .str = str.prefix },
+                    .location = .{},
+                }, .used);
+                self.stack.pop();
+                self.stack.pop();
+                try self.instrs.append(.eq);
+                try self.compileNoMatch(true, to_next, start, 1, location);
+
+                // Slice off prefix
+                try self.instrs.append(.{ .num = @floatFromInt(str.prefix.len) });
+                try self.instrs.append(.{ .global = .len });
+                try self.instrs.append(.{ .local = self.stack.size() });
+                try self.instrs.append(.nil);
+                try self.instrs.append(.cons);
+                try self.instrs.append(.call);
+                try self.instrs.append(.slice);
+
+                for (str.splits) |split| {
+                    const curr = self.stack.size();
+
+                    // Check if we can find the separator
+                    try self.instrs.append(.{ .global = .@"@str_index" });
+                    try self.instrs.append(.{ .local = curr });
+                    try self.stack.push(null);
+                    try self.stack.push(null);
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = split.separator },
+                        .location = .{},
+                    }, .used);
+                    self.stack.pop();
+                    self.stack.pop();
+                    self.stack.pop();
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.{ .local = curr + 1 });
+                    try self.instrs.append(.null);
+                    try self.instrs.append(.ne);
+                    try self.compileNoMatch(true, to_next, start, 2, location);
+
+                    if (split.pattern.data == .name and self.stack.getFromIndex(start, split.pattern.data.name) == null) {
+                        // Create the part before the separator
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .num = 0 });
+                        try self.instrs.append(.{ .local = curr + 1 });
+                        try self.instrs.append(.slice);
+
+                        // Create the part after the separator
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .pop = curr });
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .pop = curr });
+                        try self.instrs.append(.{ .num = @floatFromInt(split.separator.len) });
+                        try self.instrs.append(.add);
+                        try self.instrs.append(.{ .global = .len });
+                        try self.instrs.append(.{ .local = curr + 1 });
+                        try self.instrs.append(.nil);
+                        try self.instrs.append(.cons);
+                        try self.instrs.append(.call);
+                        try self.instrs.append(.slice);
+
+                        try self.stack.push(.{ .name = split.pattern.data.name, .info = .str });
+                    } else if (split.pattern.data == .ignore) {
+                        // Create the part after the separator
+                        try self.instrs.append(.{ .num = @floatFromInt(split.separator.len) });
+                        try self.instrs.append(.add);
+                        try self.instrs.append(.{ .global = .len });
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.nil);
+                        try self.instrs.append(.cons);
+                        try self.instrs.append(.call);
+                        try self.instrs.append(.slice);
+                    } else {
+                        // Create the part after the separator
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .local = curr + 1 });
+                        try self.instrs.append(.{ .num = @floatFromInt(split.separator.len) });
+                        try self.instrs.append(.add);
+                        try self.instrs.append(.{ .global = .len });
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.nil);
+                        try self.instrs.append(.cons);
+                        try self.instrs.append(.call);
+                        try self.instrs.append(.slice);
+
+                        // Create the part before the separator
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .pop = curr });
+                        try self.instrs.append(.{ .num = 0 });
+                        try self.instrs.append(.{ .local = curr });
+                        try self.instrs.append(.{ .pop = curr });
+                        try self.instrs.append(.slice);
+
+                        // Match with pattern
+                        try self.stack.push(null);
+                        try self.compilePattern(split.pattern, .str, to_next, start, location);
+                        self.stack.pop();
+                        if (self.stack.size() > curr) {
+                            try self.instrs.append(.{ .local = curr });
+                            try self.instrs.append(.{ .pop = curr });
+                        }
+                    }
+                }
+
+                // Check if long enough to end with suffix
+                try self.instrs.append(.{ .global = .len });
+                try self.instrs.append(.{ .local = self.stack.size() });
+                try self.instrs.append(.nil);
+                try self.instrs.append(.cons);
+                try self.instrs.append(.call);
+                try self.instrs.append(.{ .num = @floatFromInt(str.suffix.len) });
+                try self.instrs.append(.ge);
+                try self.compileNoMatch(true, to_next, start, 1, location);
+
+                if (str.last_pattern.data == .ignore) {
+                    // Check if ends with suffix
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.{ .num = @floatFromInt(str.suffix.len) });
+                    try self.instrs.append(.sub);
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.slice);
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = str.suffix },
+                        .location = .{},
+                    }, .used);
+                    self.stack.pop();
+                    try self.instrs.append(.eq);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
+                } else {
+                    // Check if ends with suffix
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.{ .num = @floatFromInt(str.suffix.len) });
+                    try self.instrs.append(.sub);
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.slice);
+                    try self.stack.push(null);
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = str.suffix },
+                        .location = .{},
+                    }, .used);
+                    self.stack.pop();
+                    self.stack.pop();
+                    try self.instrs.append(.eq);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
+
+                    // Slice off suffix
+                    try self.instrs.append(.{ .num = 0 });
+                    try self.instrs.append(.{ .global = .len });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.nil);
+                    try self.instrs.append(.cons);
+                    try self.instrs.append(.call);
+                    try self.instrs.append(.{ .num = @floatFromInt(str.suffix.len) });
+                    try self.instrs.append(.sub);
+                    try self.instrs.append(.slice);
+
+                    // Match last pattern
+                    try self.compilePattern(str.last_pattern, .str, to_next, start, location);
+                }
+            },
         }
     }
 
@@ -1347,6 +1571,7 @@ const Info = enum {
     any,
     list,
     dict,
+    str,
     all,
 
     fn merge(self: Info, other: Info) Info {
@@ -1361,6 +1586,10 @@ const Info = enum {
 
     fn isDict(self: Info) bool {
         return self == .dict or self == .all;
+    }
+
+    fn isStr(self: Info) bool {
+        return self == .str or self == .all;
     }
 };
 

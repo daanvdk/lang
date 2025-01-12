@@ -17,6 +17,7 @@ pub const Pattern = struct {
         lists: []const Pattern,
         dict: []const Pattern.Pair,
         dicts: []const Pattern,
+        str: *const Str,
     };
 
     pub fn deinit(self: Pattern, allocator: std.mem.Allocator) void {
@@ -92,6 +93,73 @@ pub const Pattern = struct {
             if (self.pattern.usesName(name)) |uses| return uses;
             if (self.cond.usesName(name)) return true;
             return null;
+        }
+    };
+
+    pub const Str = struct {
+        prefix: []const u8,
+        splits: []const StrSplit,
+        last_pattern: Pattern,
+        suffix: []const u8,
+
+        pub fn deinit(self: Str, allocator: std.mem.Allocator) void {
+            allocator.free(self.prefix);
+            for (self.splits) |split| split.deinit(allocator);
+            allocator.free(self.splits);
+            self.last_pattern.deinit(allocator);
+            allocator.free(self.suffix);
+        }
+
+        pub fn clone(self: Str, allocator: std.mem.Allocator) std.mem.Allocator.Error!Str {
+            var copy: Str = undefined;
+
+            copy.prefix = try allocator.dupe(u8, self.prefix);
+            errdefer allocator.free(copy.prefix);
+
+            const splits = try allocator.alloc(StrSplit, self.splits.len);
+            var i: usize = 0;
+            errdefer {
+                allocator.free(splits);
+                for (splits[0..i]) |item| item.deinit(allocator);
+            }
+            while (i < splits.len) : (i += 1) {
+                splits[i] = try self.splits[i].clone(allocator);
+            }
+            copy.splits = splits;
+
+            copy.last_pattern = try self.last_pattern.clone(allocator);
+            errdefer copy.last_pattern.deinit(allocator);
+
+            copy.suffix = try allocator.dupe(u8, self.suffix);
+
+            return copy;
+        }
+
+        pub fn usesName(self: Str, name: []const u8) ?bool {
+            for (self.splits) |split| if (split.usesName(name)) |uses| return uses;
+            return self.last_pattern.usesName(name);
+        }
+    };
+
+    pub const StrSplit = struct {
+        pattern: Pattern,
+        separator: []const u8,
+
+        pub fn deinit(self: StrSplit, allocator: std.mem.Allocator) void {
+            self.pattern.deinit(allocator);
+            allocator.free(self.separator);
+        }
+
+        pub fn clone(self: StrSplit, allocator: std.mem.Allocator) std.mem.Allocator.Error!StrSplit {
+            var copy: StrSplit = undefined;
+            copy.pattern = try self.pattern.clone(allocator);
+            errdefer copy.pattern.deinit(allocator);
+            copy.separator = try allocator.dupe(u8, self.separator);
+            return copy;
+        }
+
+        pub fn usesName(self: StrSplit, name: []const u8) ?bool {
+            return self.pattern.usesName(name);
         }
     };
 

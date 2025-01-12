@@ -24,6 +24,7 @@ pub const Instr = union(enum) {
     call,
     tail_call,
     get,
+    slice,
 
     pow,
     pos,
@@ -63,6 +64,8 @@ pub const Instr = union(enum) {
         join,
         print,
         import,
+        num,
+        bool,
 
         next,
         send,
@@ -73,10 +76,12 @@ pub const Instr = union(enum) {
         reduce,
         count,
         len,
+        index,
 
         @"@str_send",
         @"@dict_send",
         @"@dict_tail",
+        @"@str_index",
     };
 
     pub const Location = packed struct {
