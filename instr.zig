@@ -6,10 +6,7 @@ pub const Instr = union(enum) {
     bool: bool,
     null,
     short_str: [8]u8,
-    long_str: packed struct {
-        index: u32,
-        len: u32,
-    },
+    long_str: Location,
 
     nil,
     cons,
@@ -80,5 +77,10 @@ pub const Instr = union(enum) {
         @"@str_send",
         @"@dict_send",
         @"@dict_tail",
+    };
+
+    pub const Location = packed struct {
+        index: u32 = 0,
+        len: u32 = 0,
     };
 };

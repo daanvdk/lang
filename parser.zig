@@ -4,6 +4,7 @@ const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("token.zig").Token;
 const Expr = @import("expr.zig").Expr;
 const Pattern = @import("pattern.zig").Pattern;
+const Instr = @import("instr.zig").Instr;
 
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) Parser.Error!Expr {
     var parser = Parser.init(allocator, content);
@@ -23,6 +24,7 @@ pub const Parser = struct {
 
     token: ?Token = null,
     expected: std.EnumSet(Token.Type) = undefined,
+    last_index: usize = 0,
     skip_newlines: bool = false,
     is_gen: bool = false,
 
@@ -36,6 +38,7 @@ pub const Parser = struct {
     }
 
     fn parseModule(self: *Parser) Error!Expr {
+        const start = self.getStart();
         var fn_names = std.StringHashMap(void).init(self.allocator);
         defer fn_names.deinit();
 
@@ -79,7 +82,7 @@ pub const Parser = struct {
             } else {
                 stmt.fn_name = null;
                 const result = try self.parseGuard(.both);
-                const assign = switch (result) {
+                const assign = switch (result.data) {
                     .expr => false,
                     .pattern => assign: {
                         errdefer result.deinit(self.allocator);
@@ -93,7 +96,7 @@ pub const Parser = struct {
                     errdefer stmt.pattern.deinit(self.allocator);
                     stmt.subject = try self.parseExpr(.expr);
                 } else {
-                    stmt.pattern = .ignore;
+                    stmt.pattern = .{ .data = .ignore, .location = .{} };
                     stmt.subject = ParseType.both.toExpr(self.allocator, result);
                 }
             }
@@ -103,12 +106,17 @@ pub const Parser = struct {
             try stmts.append(stmt);
         }
 
-        return .{ .module = try stmts.toOwnedSlice() };
+        const location = self.getLocation(start);
+        return .{
+            .data = .{ .module = try stmts.toOwnedSlice() },
+            .location = location,
+        };
     }
 
     fn parseBody(self: *Parser, ends: []const Token.Type) Error!Body {
         var lets = std.ArrayList(Let).init(self.allocator);
         var last_expr: ?Expr = null;
+        var last_start: usize = undefined;
         defer {
             for (lets.items) |let| let.deinit(self.allocator);
             lets.deinit();
@@ -125,15 +133,18 @@ pub const Parser = struct {
 
             if (last_expr) |expr| {
                 try lets.append(.{
-                    .pattern = .ignore,
+                    .pattern = .{ .data = .ignore, .location = .{} },
                     .expr = expr,
                     .default = null,
+                    .start = last_start,
                 });
                 last_expr = null;
             }
 
+            const start = self.getStart();
             const result = try self.parseGuard(.both);
-            const assign = switch (result) {
+
+            const assign = switch (result.data) {
                 .expr => false,
                 .pattern => assign: {
                     errdefer result.deinit(self.allocator);
@@ -163,15 +174,17 @@ pub const Parser = struct {
                     .pattern = pattern,
                     .expr = expr,
                     .default = default,
+                    .start = start,
                 });
             } else {
                 last_expr = ParseType.both.toExpr(self.allocator, result);
+                last_start = start;
             }
 
             if (!self.peek(ends)) _ = try self.expect(&.{.newline});
         };
 
-        var expr = last_expr orelse .null;
+        var expr = last_expr orelse Expr{ .data = .null, .location = .{} };
         last_expr = null;
         errdefer expr.deinit(self.allocator);
 
@@ -181,17 +194,22 @@ pub const Parser = struct {
             const matchers = try self.allocator.alloc(Expr.Matcher, if (let.default == null) 1 else 2);
             errdefer self.allocator.free(matchers);
             matchers[0] = .{ .pattern = let.pattern, .expr = expr };
-            if (let.default) |default| matchers[1] = .{ .pattern = .ignore, .expr = default };
+            if (let.default) |default| matchers[1] = .{
+                .pattern = .{ .data = .ignore, .location = .{} },
+                .expr = default,
+            };
 
             const match = try self.allocator.create(Expr.Match);
             match.* = .{ .subject = let.expr, .matchers = matchers };
-            expr = .{ .match = match };
+            const location = self.getLocation(let.start);
+            expr = .{ .data = .{ .match = match }, .location = location };
         }
 
         return .{ .expr = expr, .end = end };
     }
 
     fn parseGuard(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseExpr(parse_type);
         if (!parse_type.isPattern(result) or self.skip(&.{.@"if"}) == null) return result;
 
@@ -203,7 +221,11 @@ pub const Parser = struct {
 
         const guard = try self.allocator.create(Pattern.Guard);
         guard.* = .{ .pattern = pattern, .cond = cond };
-        return parse_type.fromPattern(.{ .guard = guard });
+        const location = self.getLocation(start);
+        return parse_type.fromPattern(.{
+            .data = .{ .guard = guard },
+            .location = location,
+        });
     }
 
     fn parseExpr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
@@ -211,6 +233,7 @@ pub const Parser = struct {
     }
 
     fn parseOr(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseAnd(parse_type);
         if (!parse_type.isExpr(result) or self.skip(&.{.@"or"}) == null) return result;
 
@@ -222,10 +245,12 @@ pub const Parser = struct {
 
         const bin = try self.allocator.create(Expr.Bin);
         bin.* = .{ .lhs = lhs, .rhs = rhs };
-        return parse_type.fromExpr(.{ .@"or" = bin });
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{ .data = .{ .@"or" = bin }, .location = location });
     }
 
     fn parseAnd(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseNot(parse_type);
         if (!parse_type.isExpr(result) or self.skip(&.{.@"and"}) == null) return result;
 
@@ -237,20 +262,24 @@ pub const Parser = struct {
 
         const bin = try self.allocator.create(Expr.Bin);
         bin.* = .{ .lhs = lhs, .rhs = rhs };
-        return parse_type.fromExpr(.{ .@"and" = bin });
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{ .data = .{ .@"and" = bin }, .location = location });
     }
 
     fn parseNot(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         if (parse_type == .pattern) return try self.parseCmp(parse_type);
         if (self.skip(&.{.not}) == null) return try self.parseCmp(parse_type);
 
         const expr = try self.allocator.create(Expr);
         errdefer self.allocator.destroy(expr);
         expr.* = try self.parseNot(.expr);
-        return parse_type.fromExpr(.{ .not = expr });
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{ .data = .{ .not = expr }, .location = location });
     }
 
     fn parseCmp(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseAdd(parse_type);
         if (!parse_type.isExpr(result)) return result;
         const op = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge, .in }) orelse return result;
@@ -263,13 +292,18 @@ pub const Parser = struct {
 
         const bin = try self.allocator.create(Expr.Bin);
         bin.* = .{ .lhs = lhs, .rhs = rhs };
-        return parse_type.fromExpr(switch (op.type) {
-            inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @unionInit(Expr, @tagName(tag), bin),
-            else => unreachable,
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{
+            .data = switch (op.type) {
+                inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @unionInit(Expr.Data, @tagName(tag), bin),
+                else => unreachable,
+            },
+            .location = location,
         });
     }
 
     fn parseAdd(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseMul(parse_type);
         if (!parse_type.isExpr(result) or !self.peek(&.{ .add, .sub })) return result;
 
@@ -282,9 +316,13 @@ pub const Parser = struct {
 
             const bin = try self.allocator.create(Expr.Bin);
             bin.* = .{ .lhs = lhs, .rhs = rhs };
-            lhs = switch (op.type) {
-                inline .add, .sub => |tag| @unionInit(Expr, @tagName(tag), bin),
-                else => unreachable,
+            const location = self.getLocation(start);
+            lhs = .{
+                .data = switch (op.type) {
+                    inline .add, .sub => |tag| @unionInit(Expr.Data, @tagName(tag), bin),
+                    else => unreachable,
+                },
+                .location = location,
             };
         }
 
@@ -292,6 +330,7 @@ pub const Parser = struct {
     }
 
     fn parseMul(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseNeg(parse_type);
         if (!parse_type.isExpr(result) or !self.peek(&.{ .mul, .div })) return result;
 
@@ -304,9 +343,13 @@ pub const Parser = struct {
 
             const bin = try self.allocator.create(Expr.Bin);
             bin.* = .{ .lhs = lhs, .rhs = rhs };
-            lhs = switch (op.type) {
-                inline .mul, .div => |tag| @unionInit(Expr, @tagName(tag), bin),
-                else => unreachable,
+            const location = self.getLocation(start);
+            lhs = .{
+                .data = switch (op.type) {
+                    inline .mul, .div => |tag| @unionInit(Expr.Data, @tagName(tag), bin),
+                    else => unreachable,
+                },
+                .location = location,
             };
         }
 
@@ -314,20 +357,26 @@ pub const Parser = struct {
     }
 
     fn parseNeg(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         if (parse_type == .pattern) return try self.parsePow(parse_type);
         const op = self.skip(&.{ .add, .sub }) orelse return try self.parsePow(parse_type);
 
         const expr = try self.allocator.create(Expr);
         errdefer self.allocator.destroy(expr);
         expr.* = try self.parseNeg(.expr);
-        return parse_type.fromExpr(switch (op.type) {
-            .add => .{ .pos = expr },
-            .sub => .{ .neg = expr },
-            else => unreachable,
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{
+            .data = switch (op.type) {
+                .add => .{ .pos = expr },
+                .sub => .{ .neg = expr },
+                else => unreachable,
+            },
+            .location = location,
         });
     }
 
     fn parsePow(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseCall(parse_type, false);
         if (!parse_type.isExpr(result) or self.skip(&.{.pow}) == null) return result;
 
@@ -339,10 +388,12 @@ pub const Parser = struct {
 
         const bin = try self.allocator.create(Expr.Bin);
         bin.* = .{ .lhs = lhs, .rhs = rhs };
-        return parse_type.fromExpr(.{ .pow = bin });
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{ .data = .{ .pow = bin }, .location = location });
     }
 
     fn parseCall(self: *Parser, comptime parse_type: ParseType, get_only: bool) Error!parse_type.Result() {
+        const start = self.getStart();
         const result = try self.parseLit(parse_type);
         if (!parse_type.isExpr(result) or !self.peek(if (get_only) &.{ .dot, .llist } else &.{ .lpar, .pipe, .dot, .llist })) return result;
 
@@ -356,7 +407,8 @@ pub const Parser = struct {
 
                 const bin = try self.allocator.create(Expr.Bin);
                 bin.* = .{ .lhs = lhs, .rhs = rhs };
-                lhs = .{ .call = bin };
+                const location = self.getLocation(start);
+                lhs = .{ .data = .{ .call = bin }, .location = location };
             } else if (!get_only and self.skip(&.{.pipe}) != null) {
                 var owner = true;
                 errdefer if (owner) lhs.deinit(self.allocator);
@@ -367,26 +419,37 @@ pub const Parser = struct {
                 bin.lhs = try self.parseCall(.expr, true);
                 errdefer bin.lhs.deinit(self.allocator);
 
+                const col_start = self.getStart();
                 _ = try self.expect(&.{.lpar});
+                const items_start = self.getStart();
+
                 const old_skip = self.skip_newlines;
                 defer self.skip_newlines = old_skip;
                 self.skip_newlines = true;
+
                 var state = ColState(.list, .expr).init(self.allocator);
                 defer state.deinit();
-                try state.append(false, undefined, lhs);
+                try state.append(null, undefined, lhs);
                 owner = false;
-                bin.rhs = try self.parseColTail(.list, .expr, &state, .rpar);
+                bin.rhs = try self.parseColTail(.list, .expr, &state, col_start, items_start, .rpar);
 
-                lhs = .{ .call = bin };
+                const location = self.getLocation(start);
+                lhs = .{ .data = .{ .call = bin }, .location = location };
             } else if (self.skip(&.{.dot}) != null) {
                 errdefer lhs.deinit(self.allocator);
+                const key_start = self.getStart();
                 const name = try self.expect(&.{.name});
-                const rhs = Expr{ .str = try self.allocator.dupe(u8, name.content) };
+                const key_location = self.getLocation(key_start);
+                const rhs = Expr{
+                    .data = .{ .str = try self.allocator.dupe(u8, name.content) },
+                    .location = key_location,
+                };
                 errdefer rhs.deinit(self.allocator);
 
                 const bin = try self.allocator.create(Expr.Bin);
                 bin.* = .{ .lhs = lhs, .rhs = rhs };
-                lhs = .{ .get = bin };
+                const location = self.getLocation(start);
+                lhs = .{ .data = .{ .get = bin }, .location = location };
             } else if (self.skip(&.{.llist}) != null) {
                 const old_skip = self.skip_newlines;
                 defer self.skip_newlines = old_skip;
@@ -399,7 +462,8 @@ pub const Parser = struct {
 
                 const bin = try self.allocator.create(Expr.Bin);
                 bin.* = .{ .lhs = lhs, .rhs = rhs };
-                lhs = .{ .get = bin };
+                const location = self.getLocation(start);
+                lhs = .{ .data = .{ .get = bin }, .location = location };
             } else {
                 break;
             }
@@ -450,34 +514,47 @@ pub const Parser = struct {
     }
 
     fn parseName(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
+        const start = self.getStart();
         const token = try self.expect(&.{.name});
-        return switch (parse_type) {
-            .expr, .pattern => .{ .name = token.content },
-            .both => .{ .both = .{
-                .expr = .{ .name = token.content },
-                .pattern = .{ .name = token.content },
-            } },
+        const location = self.getLocation(start);
+
+        return .{
+            .data = switch (parse_type) {
+                .expr, .pattern => .{ .name = token.content },
+                .both => .{ .both = .{
+                    .expr = .{ .name = token.content },
+                    .pattern = .{ .name = token.content },
+                } },
+            },
+            .location = location,
         };
     }
 
     fn parseNum(self: *Parser) Error!Expr {
+        const start = self.getStart();
         const token = try self.expect(&.{.num});
         const value = std.fmt.parseFloat(f64, token.content) catch return error.ParseError;
-        return .{ .num = value };
+        const location = self.getLocation(start);
+        return .{ .data = .{ .num = value }, .location = location };
     }
 
     fn parseBool(self: *Parser) Error!Expr {
+        const start = self.getStart();
         const token = try self.expect(&.{.bool});
         const value = std.mem.eql(u8, token.content, "true");
-        return .{ .bool = value };
+        const location = self.getLocation(start);
+        return .{ .data = .{ .bool = value }, .location = location };
     }
 
     fn parseNull(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.null});
-        return .null;
+        const location = self.getLocation(start);
+        return .{ .data = .null, .location = location };
     }
 
     fn parseStr(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.str});
 
         var exprs = std.ArrayList(Expr).init(self.allocator);
@@ -487,15 +564,28 @@ pub const Parser = struct {
         }
 
         while (true) {
+            const chunk_start = self.lexer.index;
             const chunk = try self.lexer.strChunk(self.allocator);
+            const chunk_end = self.lexer.index - @as(usize, if (chunk.expr) 2 else 1);
+            self.last_index = self.lexer.index;
 
             if (!chunk.expr and exprs.items.len == 0) {
-                return .{ .str = chunk.content };
+                const location = self.getLocation(start);
+                return .{
+                    .data = .{ .str = chunk.content },
+                    .location = location,
+                };
             }
 
             if (chunk.content.len > 0) {
                 errdefer self.allocator.free(chunk.content);
-                try exprs.append(.{ .str = chunk.content });
+                try exprs.append(.{
+                    .data = .{ .str = chunk.content },
+                    .location = .{
+                        .index = @truncate(chunk_start),
+                        .len = @truncate(chunk_end - chunk_start),
+                    },
+                });
             } else {
                 self.allocator.free(chunk.content);
             }
@@ -512,18 +602,21 @@ pub const Parser = struct {
             try exprs.append(expr);
         }
 
-        const bin = try self.allocator.create(Expr.Bin);
-        errdefer self.allocator.destroy(bin);
-        bin.* = .{
-            .lhs = .{ .global = .str },
-            .rhs = .{ .list = try exprs.toOwnedSlice() },
+        const location = self.getLocation(start);
+        const call = try self.allocator.create(Expr.Bin);
+        errdefer self.allocator.destroy(call);
+        call.* = .{
+            .lhs = .{ .data = .{ .global = .str }, .location = .{} },
+            .rhs = .{ .data = .{ .list = try exprs.toOwnedSlice() }, .location = location },
         };
-        return .{ .call = bin };
+        return .{ .data = .{ .call = call }, .location = location };
     }
 
     fn parseIgnore(self: *Parser) Error!Pattern {
+        const start = self.getStart();
         _ = try self.expect(&.{.ignore});
-        return .ignore;
+        const location = self.getLocation(start);
+        return .{ .data = .ignore, .location = location };
     }
 
     fn parseCol(
@@ -533,7 +626,9 @@ pub const Parser = struct {
         start: Token.Type,
         end: Token.Type,
     ) Error!parse_type.Result() {
+        const col_start = self.getStart();
         _ = try self.expect(&.{start});
+        const items_start = self.getStart();
 
         const old_skip = self.skip_newlines;
         defer self.skip_newlines = old_skip;
@@ -542,7 +637,7 @@ pub const Parser = struct {
         var state = ColState(col_type, parse_type).init(self.allocator);
         defer state.deinit();
 
-        return try self.parseColTail(col_type, parse_type, &state, end);
+        return try self.parseColTail(col_type, parse_type, &state, col_start, items_start, end);
     }
 
     fn parseColTail(
@@ -550,26 +645,41 @@ pub const Parser = struct {
         comptime col_type: ColType,
         comptime parse_type: ParseType,
         state: *ColState(col_type, parse_type),
+        start: usize,
+        init_items_start: usize,
         end: Token.Type,
     ) Error!parse_type.Result() {
-        while (self.skip(&.{end}) == null) {
-            const is_col = self.skip(&.{.mul}) != null;
+        var items_start = init_items_start;
+        const items_location = while (true) {
+            var items_location: ?Instr.Location = self.getLocation(start);
+            if (self.skip(&.{end}) != null) break items_location.?;
+            if (self.skip(&.{.mul}) == null) items_location = null;
             var owner = true;
 
             var key: Expr = undefined;
             var item: parse_type.Result() = undefined;
 
-            if (col_type != .dict or is_col) {
+            if (col_type != .dict or items_location != null) {
                 item = try self.parseExpr(parse_type);
             } else if (self.peek(&.{.name}) and self.peekAhead(1, &.{ .comma, end })) {
+                const key_start = self.getStart();
                 const token = try self.expect(&.{.name});
-                key = .{ .str = try self.allocator.dupe(u8, token.content) };
-                item = switch (parse_type) {
-                    .expr, .pattern => .{ .name = token.content },
-                    .both => .{ .both = .{
-                        .expr = .{ .name = token.content },
-                        .pattern = .{ .name = token.content },
-                    } },
+                const location = self.getLocation(key_start);
+
+                key = .{
+                    .data = .{ .str = try self.allocator.dupe(u8, token.content) },
+                    .location = location,
+                };
+
+                item = .{
+                    .data = switch (parse_type) {
+                        .expr, .pattern => .{ .name = token.content },
+                        .both => .{ .both = .{
+                            .expr = .{ .name = token.content },
+                            .pattern = .{ .name = token.content },
+                        } },
+                    },
+                    .location = location,
                 };
             } else {
                 key = try self.parseExpr(.expr);
@@ -579,38 +689,44 @@ pub const Parser = struct {
             }
 
             errdefer if (owner) {
-                if (col_type == .dict and !is_col) key.deinit(self.allocator);
+                if (col_type == .dict and items_location == null) key.deinit(self.allocator);
                 item.deinit(self.allocator);
             };
 
             if (!self.peek(&.{end})) _ = try self.expect(&.{.comma});
 
+            if (items_location != null) items_start = self.getStart();
+
             switch (parse_type) {
                 .expr, .pattern => {
-                    try state.append(is_col, key, item);
+                    try state.append(items_location, key, item);
                 },
-                .both => switch (item) {
+                .both => switch (item.detail()) {
                     .expr => |expr| {
                         var expr_state = try state.toExpr();
                         defer expr_state.deinit();
-                        try expr_state.append(is_col, key, expr);
+                        try expr_state.append(items_location, key, expr);
                         owner = false;
-                        return parse_type.fromExpr(try self.parseColTail(col_type, .expr, &expr_state, end));
+                        return parse_type.fromExpr(try self.parseColTail(col_type, .expr, &expr_state, start, items_start, end));
                     },
                     .pattern => |pattern| {
                         var pattern_state = try state.toPattern();
                         defer pattern_state.deinit();
-                        try pattern_state.append(is_col, key, pattern);
+                        try pattern_state.append(items_location, key, pattern);
                         owner = false;
-                        return parse_type.fromPattern(try self.parseColTail(col_type, .pattern, &pattern_state, end));
+                        return parse_type.fromPattern(try self.parseColTail(col_type, .pattern, &pattern_state, start, items_start, end));
                     },
                     .both => |both| {
-                        try state.append(is_col, key, both);
+                        try state.append(items_location, key, both);
                     },
                 },
             }
-        }
-        return try state.toResult();
+        };
+
+        return .{
+            .data = try state.toResult(items_location),
+            .location = self.getLocation(start),
+        };
     }
 
     fn parseLambda(self: *Parser) Error!Expr {
@@ -618,12 +734,16 @@ pub const Parser = struct {
         defer self.is_gen = old_is_gen;
         self.is_gen = false;
 
+        const start = self.getStart();
+
         const matcher = try self.allocator.create(Expr.Matcher);
         errdefer self.allocator.destroy(matcher);
         matcher.pattern = try self.parseCol(.list, .pattern, .lambda, .lambda);
         errdefer matcher.pattern.deinit(self.allocator);
         matcher.expr = try self.parseExpr(.expr);
-        return .{ .lambda = matcher };
+
+        const location = self.getLocation(start);
+        return .{ .data = .{ .lambda = matcher }, .location = location };
     }
 
     fn parsePar(self: *Parser) Error!Expr {
@@ -642,6 +762,7 @@ pub const Parser = struct {
     }
 
     fn parseDo(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.do});
         const is_gen = self.skip(&.{.mul}) != null;
 
@@ -655,10 +776,13 @@ pub const Parser = struct {
         errdefer body.expr.deinit(self.allocator);
         const expr_ptr = try self.allocator.create(Expr);
         expr_ptr.* = body.expr;
-        return .{ .gen = expr_ptr };
+
+        const location = self.getLocation(start);
+        return .{ .data = .{ .gen = expr_ptr }, .location = location };
     }
 
     fn parseMatch(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.match});
 
         const old_skip = self.skip_newlines;
@@ -696,11 +820,16 @@ pub const Parser = struct {
 
         const match = try self.allocator.create(Expr.Match);
         errdefer self.allocator.destroy(match);
-        match.* = .{ .subject = subject, .matchers = try matchers.toOwnedSlice() };
-        return .{ .match = match };
+        match.* = .{
+            .subject = subject,
+            .matchers = try matchers.toOwnedSlice(),
+        };
+        const location = self.getLocation(start);
+        return .{ .data = .{ .match = match }, .location = location };
     }
 
     fn parseIf(self: *Parser) Error!Expr {
+        var start = self.getStart();
         _ = try self.expect(&.{.@"if"});
 
         const old_skip = self.skip_newlines;
@@ -715,7 +844,7 @@ pub const Parser = struct {
 
         const has_else = while (true) {
             const result = try self.parseGuard(.both);
-            const assign = switch (result) {
+            const assign = switch (result.data) {
                 .expr => false,
                 .pattern => assign: {
                     errdefer result.deinit(self.allocator);
@@ -740,8 +869,9 @@ pub const Parser = struct {
             const body = try self.parseBody(&.{ .elif, .@"else", .end });
             errdefer body.expr.deinit(self.allocator);
 
-            try branches.append(.{ .cond = cond, .then = body.expr });
+            try branches.append(.{ .cond = cond, .then = body.expr, .start = start });
 
+            start = self.lexer.getIndex(body.end);
             switch (body.end.type) {
                 .elif => {},
                 .@"else" => break true,
@@ -755,29 +885,32 @@ pub const Parser = struct {
             const body = try self.parseBody(&.{.end});
             expr = body.expr;
         } else {
-            expr = .null;
+            expr = .{ .data = .null, .location = self.getLocation(start) };
         }
         errdefer expr.deinit(self.allocator);
 
         while (branches.popOrNull()) |branch| {
             errdefer branch.deinit(self.allocator);
-            switch (branch.cond) {
-                .@"if" => |cond| {
-                    const if_ = try self.allocator.create(Expr.If);
-                    if_.* = .{ .cond = cond, .then = branch.then, .else_ = expr };
-                    expr = .{ .@"if" = if_ };
-                },
-                .match => |cond| {
-                    const matchers = try self.allocator.alloc(Expr.Matcher, 2);
-                    errdefer self.allocator.free(matchers);
-                    matchers[0] = .{ .pattern = cond.pattern, .expr = branch.then };
-                    matchers[1] = .{ .pattern = .ignore, .expr = expr };
+            expr = .{
+                .data = switch (branch.cond) {
+                    .@"if" => |cond| data: {
+                        const if_ = try self.allocator.create(Expr.If);
+                        if_.* = .{ .cond = cond, .then = branch.then, .else_ = expr };
+                        break :data .{ .@"if" = if_ };
+                    },
+                    .match => |cond| data: {
+                        const matchers = try self.allocator.alloc(Expr.Matcher, 2);
+                        errdefer self.allocator.free(matchers);
+                        matchers[0] = .{ .pattern = cond.pattern, .expr = branch.then };
+                        matchers[1] = .{ .pattern = .{ .data = .ignore, .location = .{} }, .expr = expr };
 
-                    const match = try self.allocator.create(Expr.Match);
-                    match.* = .{ .subject = cond.expr, .matchers = matchers };
-                    expr = .{ .match = match };
+                        const match = try self.allocator.create(Expr.Match);
+                        match.* = .{ .subject = cond.expr, .matchers = matchers };
+                        break :data .{ .match = match };
+                    },
                 },
-            }
+                .location = self.getLocation(branch.start),
+            };
         }
 
         return expr;
@@ -795,7 +928,9 @@ pub const Parser = struct {
 
         _ = try self.expect(&.{.in});
 
+        const start = self.getStart();
         const subject = try self.parseExpr(.expr);
+        const location = self.getLocation(start);
         errdefer subject.deinit(self.allocator);
 
         _ = try self.expect(&.{.do});
@@ -808,11 +943,12 @@ pub const Parser = struct {
             .subject = subject,
             .matcher = .{ .pattern = pattern, .expr = body.expr },
         };
-        return .{ .@"for" = for_ };
+        return .{ .data = .{ .@"for" = for_ }, .location = location };
     }
 
     fn parseYield(self: *Parser) Error!Expr {
         std.debug.assert(self.is_gen);
+        const start = self.getStart();
         _ = try self.expect(&.{.yield});
         const is_all = self.skip(&.{.mul}) != null;
 
@@ -820,27 +956,35 @@ pub const Parser = struct {
         errdefer self.allocator.destroy(expr);
         expr.* = try self.parseExpr(.expr);
 
-        return if (is_all) .{ .yield_all = expr } else .{ .yield = expr };
+        const location = self.getLocation(start);
+        return .{
+            .data = if (is_all) .{ .yield_all = expr } else .{ .yield = expr },
+            .location = location,
+        };
     }
 
     fn parseReturn(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.@"return"});
 
         const expr = try self.allocator.create(Expr);
         errdefer self.allocator.destroy(expr);
         expr.* = try self.parseExpr(.expr);
 
-        return .{ .@"return" = expr };
+        const location = self.getLocation(start);
+        return .{ .data = .{ .@"return" = expr }, .location = location };
     }
 
     fn parseAssert(self: *Parser) Error!Expr {
+        const start = self.getStart();
         _ = try self.expect(&.{.assert});
 
         const expr = try self.allocator.create(Expr);
         errdefer self.allocator.destroy(expr);
         expr.* = try self.parseExpr(.expr);
 
-        return .{ .assert = expr };
+        const location = self.getLocation(start);
+        return .{ .data = .{ .assert = expr }, .location = location };
     }
 
     fn peek(self: *Parser, token_types: []const Token.Type) bool {
@@ -867,6 +1011,8 @@ pub const Parser = struct {
     fn peekAhead(self: *Parser, n: usize, token_types: []const Token.Type) bool {
         if (n == 0) return self.peek(token_types);
 
+        _ = self.peek(&.{});
+
         const lexer = self.lexer;
         const token = self.token;
         const expected = self.expected;
@@ -884,6 +1030,10 @@ pub const Parser = struct {
         if (!self.peek(token_types)) return null;
         const token = self.token.?;
         self.token = null;
+
+        self.last_index = self.lexer.index;
+        if (self.lexer.next_token) |token_| self.last_index -= token_.content.len;
+
         return token;
     }
 
@@ -920,6 +1070,28 @@ pub const Parser = struct {
 
         return error.ParseError;
     }
+
+    fn getStart(self: *Parser) usize {
+        _ = self.peek(&.{});
+        var index = self.lexer.index;
+        if (self.lexer.next_token) |token| index -= token.content.len;
+        if (self.token) |token| index -= token.content.len;
+        return index;
+    }
+
+    fn getLocation(self: *Parser, start: usize) Instr.Location {
+        return .{
+            .index = @truncate(start),
+            .len = @truncate(self.last_index - start),
+        };
+    }
+
+    fn isSpace(self: *Parser, init_index: usize) bool {
+        return switch (self.lexer.content[init_index]) {
+            ' ', '\n', '\t', '\r' => true,
+            else => false,
+        };
+    }
 };
 
 const Body = struct {
@@ -944,7 +1116,7 @@ const ParseType = enum {
         return switch (self) {
             .expr => true,
             .pattern => false,
-            .both => result != .pattern,
+            .both => result.data != .pattern,
         };
     }
 
@@ -952,12 +1124,12 @@ const ParseType = enum {
         return switch (self) {
             .expr => result,
             .pattern => unreachable,
-            .both => switch (result) {
+            .both => switch (result.detail()) {
                 .expr => |expr| expr,
                 .pattern => unreachable,
                 .both => |both| expr: {
-                    both.pattern.deinit(allocator);
-                    break :expr both.expr;
+                    both.pattern().deinit(allocator);
+                    break :expr both.expr();
                 },
             },
         };
@@ -967,7 +1139,10 @@ const ParseType = enum {
         return switch (self) {
             .expr => expr,
             .pattern => unreachable,
-            .both => .{ .expr = expr },
+            .both => .{
+                .data = .{ .expr = expr.data },
+                .location = expr.location,
+            },
         };
     }
 
@@ -975,7 +1150,7 @@ const ParseType = enum {
         return switch (self) {
             .expr => false,
             .pattern => true,
-            .both => result != .expr,
+            .both => result.data != .expr,
         };
     }
 
@@ -983,12 +1158,12 @@ const ParseType = enum {
         return switch (self) {
             .expr => unreachable,
             .pattern => result,
-            .both => switch (result) {
+            .both => switch (result.detail()) {
                 .expr => unreachable,
                 .pattern => |pattern| pattern,
                 .both => |both| pattern: {
-                    both.expr.deinit(allocator);
-                    break :pattern both.pattern;
+                    both.expr().deinit(allocator);
+                    break :pattern both.pattern();
                 },
             },
         };
@@ -998,7 +1173,10 @@ const ParseType = enum {
         return switch (self) {
             .expr => unreachable,
             .pattern => pattern,
-            .both => .{ .pattern = pattern },
+            .both => .{
+                .data = .{ .pattern = pattern.data },
+                .location = pattern.location,
+            },
         };
     }
 
@@ -1009,41 +1187,80 @@ const ParseType = enum {
                 errdefer expr.deinit(allocator);
                 const expr_ptr = try allocator.create(Expr);
                 expr_ptr.* = expr;
-                return .{ .expr = expr_ptr };
+                return .{
+                    .data = .{ .expr = expr_ptr },
+                    .location = expr.location,
+                };
             },
             .both => {
                 errdefer expr.deinit(allocator);
                 const expr_ptr = try allocator.create(Expr);
                 errdefer allocator.destroy(expr_ptr);
                 expr_ptr.* = try expr.clone(allocator);
-                return .{ .both = .{
-                    .expr = expr,
-                    .pattern = .{ .expr = expr_ptr },
-                } };
+                return .{
+                    .data = .{ .both = .{
+                        .expr = expr.data,
+                        .pattern = .{ .expr = expr_ptr },
+                    } },
+                    .location = expr.location,
+                };
             },
         }
     }
 };
 
-const ParseResult = union(ParseType) {
-    expr: Expr,
-    pattern: Pattern,
-    both: Both,
+const ParseResult = struct {
+    data: Data,
+    location: Instr.Location,
+
+    const Data = union(ParseType) {
+        expr: Expr.Data,
+        pattern: Pattern.Data,
+        both: Both.Data,
+    };
+
+    const Detail = union(ParseType) {
+        expr: Expr,
+        pattern: Pattern,
+        both: Both,
+    };
+
+    fn detail(self: ParseResult) Detail {
+        return switch (self.data) {
+            inline else => |data, tag| @unionInit(Detail, @tagName(tag), .{
+                .data = data,
+                .location = self.location,
+            }),
+        };
+    }
 
     fn deinit(self: ParseResult, allocator: std.mem.Allocator) void {
-        switch (self) {
+        switch (self.detail()) {
             inline else => |value| value.deinit(allocator),
         }
     }
 };
 
 const Both = struct {
-    expr: Expr,
-    pattern: Pattern,
+    data: Data,
+    location: Instr.Location,
+
+    const Data = struct {
+        expr: Expr.Data,
+        pattern: Pattern.Data,
+    };
+
+    fn expr(self: Both) Expr {
+        return .{ .data = self.data.expr, .location = self.location };
+    }
+
+    fn pattern(self: Both) Pattern {
+        return .{ .data = self.data.pattern, .location = self.location };
+    }
 
     fn deinit(self: Both, allocator: std.mem.Allocator) void {
-        self.expr.deinit(allocator);
-        self.pattern.deinit(allocator);
+        self.expr().deinit(allocator);
+        self.pattern().deinit(allocator);
     }
 
     const Pair = struct {
@@ -1090,9 +1307,9 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
             self.cols.deinit();
         }
 
-        inline fn append(self: *Self, is_col: bool, key: Expr, value: Col) !void {
-            if (is_col) {
-                try self.appendCol(value);
+        inline fn append(self: *Self, items_location: ?Instr.Location, key: Expr, value: Col) !void {
+            if (items_location) |location| {
+                try self.appendCol(location, value);
             } else if (col_type == .dict) {
                 try self.appendItem(.{ .key = key, .value = value });
             } else {
@@ -1104,8 +1321,8 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
             try self.items.append(item);
         }
 
-        fn appendCol(self: *Self, col: Col) !void {
-            try self.itemsToCol();
+        fn appendCol(self: *Self, location: Instr.Location, col: Col) !void {
+            try self.itemsToCol(location);
             try self.cols.append(col);
         }
 
@@ -1118,19 +1335,19 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
             try expr_state.items.ensureUnusedCapacity(self.items.items.len);
             for (self.items.items) |both| {
                 if (col_type == .dict) {
-                    both.value.pattern.deinit(self.items.allocator);
-                    expr_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.expr });
+                    both.value.pattern().deinit(self.items.allocator);
+                    expr_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.expr() });
                 } else {
-                    both.pattern.deinit(self.items.allocator);
-                    expr_state.items.appendAssumeCapacity(both.expr);
+                    both.pattern().deinit(self.items.allocator);
+                    expr_state.items.appendAssumeCapacity(both.expr());
                 }
             }
             self.items.clearAndFree();
 
             try expr_state.cols.ensureUnusedCapacity(self.cols.items.len);
             for (self.cols.items) |both| {
-                both.pattern.deinit(self.items.allocator);
-                expr_state.cols.appendAssumeCapacity(both.expr);
+                both.pattern().deinit(self.items.allocator);
+                expr_state.cols.appendAssumeCapacity(both.expr());
             }
             self.cols.clearAndFree();
 
@@ -1146,29 +1363,29 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
             try pattern_state.items.ensureUnusedCapacity(self.items.items.len);
             for (self.items.items) |both| {
                 if (col_type == .dict) {
-                    both.value.expr.deinit(self.items.allocator);
-                    pattern_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.pattern });
+                    both.value.expr().deinit(self.items.allocator);
+                    pattern_state.items.appendAssumeCapacity(.{ .key = both.key, .value = both.value.pattern() });
                 } else {
-                    both.expr.deinit(self.items.allocator);
-                    pattern_state.items.appendAssumeCapacity(both.pattern);
+                    both.expr().deinit(self.items.allocator);
+                    pattern_state.items.appendAssumeCapacity(both.pattern());
                 }
             }
             self.items.clearAndFree();
 
             try pattern_state.cols.ensureUnusedCapacity(self.cols.items.len);
             for (self.cols.items) |both| {
-                both.expr.deinit(self.items.allocator);
-                pattern_state.cols.appendAssumeCapacity(both.pattern);
+                both.expr().deinit(self.items.allocator);
+                pattern_state.cols.appendAssumeCapacity(both.pattern());
             }
             self.cols.clearAndFree();
 
             return pattern_state;
         }
 
-        fn aggregate(self: *Self, comptime field: []const u8, comptime tag: []const u8) !Col {
+        fn aggregate(self: *Self, comptime field: []const u8, comptime tag: []const u8) !Col.Data {
             switch (parse_type) {
                 .expr, .pattern => {
-                    return @unionInit(Col, tag, try @field(self, field).toOwnedSlice());
+                    return @unionInit(Col.Data, tag, try @field(self, field).toOwnedSlice());
                 },
                 .both => {
                     const allocator = self.items.allocator;
@@ -1185,36 +1402,39 @@ fn ColState(comptime col_type: ColType, comptime parse_type: ParseType) type {
                     while (i < @field(self, field).items.len) : (i += 1) {
                         const both = @field(self, field).items[i];
                         if (is_pair) {
-                            exprs[i] = .{ .key = both.key, .value = both.value.expr };
-                            patterns[i] = .{ .key = try both.key.clone(allocator), .value = both.value.pattern };
+                            exprs[i] = .{ .key = both.key, .value = both.value.expr() };
+                            patterns[i] = .{ .key = try both.key.clone(allocator), .value = both.value.pattern() };
                         } else {
-                            exprs[i] = both.expr;
-                            patterns[i] = both.pattern;
+                            exprs[i] = both.expr();
+                            patterns[i] = both.pattern();
                         }
                     }
                     @field(self, field).clearAndFree();
 
                     return .{
-                        .expr = @unionInit(Expr, tag, exprs),
-                        .pattern = @unionInit(Pattern, tag, patterns),
+                        .expr = @unionInit(Expr.Data, tag, exprs),
+                        .pattern = @unionInit(Pattern.Data, tag, patterns),
                     };
                 },
             }
         }
 
-        fn itemsToCol(self: *Self) !void {
+        fn itemsToCol(self: *Self, location: Instr.Location) !void {
             if (self.items.items.len == 0) return;
-            const col = try self.aggregate("items", @tagName(col_type));
+            const col = Col{
+                .data = try self.aggregate("items", @tagName(col_type)),
+                .location = location,
+            };
             errdefer col.deinit(self.items.allocator);
             try self.cols.append(col);
         }
 
-        fn toResult(self: *Self) !parse_type.Result() {
-            var result: Col = undefined;
+        fn toResult(self: *Self, location: Instr.Location) !parse_type.Result().Data {
+            var result: Col.Data = undefined;
             if (self.cols.items.len == 0) {
                 result = try self.aggregate("items", @tagName(col_type));
             } else {
-                try self.itemsToCol();
+                try self.itemsToCol(location);
                 result = try self.aggregate("cols", @tagName(col_type) ++ "s");
             }
             return if (parse_type == .both) .{ .both = result } else result;
@@ -1226,6 +1446,7 @@ const Let = struct {
     pattern: Pattern,
     expr: Expr,
     default: ?Expr,
+    start: usize,
 
     fn deinit(self: Let, allocator: std.mem.Allocator) void {
         self.pattern.deinit(allocator);
@@ -1248,6 +1469,7 @@ const IfCond = union(enum) {
 const IfBranch = struct {
     cond: IfCond,
     then: Expr,
+    start: usize,
 
     fn deinit(self: IfBranch, allocator: std.mem.Allocator) void {
         self.cond.deinit(allocator);
@@ -1258,46 +1480,85 @@ const IfBranch = struct {
 test "parse num 1" {
     const expr = try internal_parse(std.testing.allocator, "1337");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .num = 1337 }, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .num = 1337 },
+        .location = .{ .index = 0, .len = 4 },
+    }, expr);
 }
 
 test "parse num 2" {
     const expr = try internal_parse(std.testing.allocator, "45.67");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .num = 45.67 }, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .num = 45.67 },
+        .location = .{ .index = 0, .len = 5 },
+    }, expr);
 }
 
 test "parse bool 1" {
     const expr = try internal_parse(std.testing.allocator, "true");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .bool = true }, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .bool = true },
+        .location = .{ .index = 0, .len = 4 },
+    }, expr);
 }
 
 test "parse bool 2" {
     const expr = try internal_parse(std.testing.allocator, "false");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .bool = false }, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .bool = false },
+        .location = .{ .index = 0, .len = 5 },
+    }, expr);
 }
 
 test "parse null" {
     const expr = try internal_parse(std.testing.allocator, "null");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr.null, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .null,
+        .location = .{ .index = 0, .len = 4 },
+    }, expr);
 }
 
 test "parse operators" {
     const expr = try internal_parse(std.testing.allocator, "1 * 2 + 3 / -4");
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .add = &.{
-        .lhs = .{ .mul = &.{
-            .lhs = .{ .num = 1 },
-            .rhs = .{ .num = 2 },
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .add = &.{
+            .lhs = .{
+                .data = .{ .mul = &.{
+                    .lhs = .{
+                        .data = .{ .num = 1 },
+                        .location = .{ .index = 0, .len = 1 },
+                    },
+                    .rhs = .{
+                        .data = .{ .num = 2 },
+                        .location = .{ .index = 4, .len = 1 },
+                    },
+                } },
+                .location = .{ .index = 0, .len = 5 },
+            },
+            .rhs = .{
+                .data = .{ .div = &.{
+                    .lhs = .{
+                        .data = .{ .num = 3 },
+                        .location = .{ .index = 8, .len = 1 },
+                    },
+                    .rhs = .{
+                        .data = .{ .neg = &.{
+                            .data = .{ .num = 4 },
+                            .location = .{ .index = 13, .len = 1 },
+                        } },
+                        .location = .{ .index = 12, .len = 2 },
+                    },
+                } },
+                .location = .{ .index = 8, .len = 6 },
+            },
         } },
-        .rhs = .{ .div = &.{
-            .lhs = .{ .num = 3 },
-            .rhs = .{ .neg = &.{ .num = 4 } },
-        } },
-    } }, expr);
+        .location = .{ .index = 0, .len = 14 },
+    }, expr);
 }
 
 test "parse var" {
@@ -1306,16 +1567,34 @@ test "parse var" {
         \\x * x
     ));
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .match = &.{
-        .subject = .{ .num = 4 },
-        .matchers = &.{.{
-            .pattern = .{ .name = "x" },
-            .expr = .{ .mul = &.{
-                .lhs = .{ .name = "x" },
-                .rhs = .{ .name = "x" },
-            } },
-        }},
-    } }, expr);
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .num = 4 },
+                .location = .{ .index = 4, .len = 1 },
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "x" },
+                    .location = .{ .index = 0, .len = 1 },
+                },
+                .expr = .{
+                    .data = .{ .mul = &.{
+                        .lhs = .{
+                            .data = .{ .name = "x" },
+                            .location = .{ .index = 6, .len = 1 },
+                        },
+                        .rhs = .{
+                            .data = .{ .name = "x" },
+                            .location = .{ .index = 10, .len = 1 },
+                        },
+                    } },
+                    .location = .{ .index = 6, .len = 5 },
+                },
+            }},
+        } },
+        .location = .{ .index = 0, .len = 11 },
+    }, expr);
 }
 
 test "parse lambda" {
@@ -1324,26 +1603,62 @@ test "parse lambda" {
         \\sqr(4)
     ));
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .match = &.{
-        .subject = .{ .lambda = &.{
-            .pattern = .{ .list = &.{
-                .{ .name = "x" },
-            } },
-            .expr = .{ .mul = &.{
-                .lhs = .{ .name = "x" },
-                .rhs = .{ .name = "x" },
-            } },
-        } },
-        .matchers = &.{.{
-            .pattern = .{ .name = "sqr" },
-            .expr = .{ .call = &.{
-                .lhs = .{ .name = "sqr" },
-                .rhs = .{ .list = &.{
-                    .{ .num = 4 },
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .lambda = &.{
+                    .pattern = .{
+                        .data = .{ .list = &.{
+                            .{
+                                .data = .{ .name = "x" },
+                                .location = .{ .index = 7, .len = 1 },
+                            },
+                        } },
+                        .location = .{ .index = 6, .len = 3 },
+                    },
+                    .expr = .{
+                        .data = .{ .mul = &.{
+                            .lhs = .{
+                                .data = .{ .name = "x" },
+                                .location = .{ .index = 10, .len = 1 },
+                            },
+                            .rhs = .{
+                                .data = .{ .name = "x" },
+                                .location = .{ .index = 14, .len = 1 },
+                            },
+                        } },
+                        .location = .{ .index = 10, .len = 5 },
+                    },
                 } },
-            } },
-        }},
-    } }, expr);
+                .location = .{ .index = 6, .len = 9 },
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "sqr" },
+                    .location = .{ .index = 0, .len = 3 },
+                },
+                .expr = .{
+                    .data = .{ .call = &.{
+                        .lhs = .{
+                            .data = .{ .name = "sqr" },
+                            .location = .{ .index = 16, .len = 3 },
+                        },
+                        .rhs = .{
+                            .data = .{ .list = &.{
+                                .{
+                                    .data = .{ .num = 4 },
+                                    .location = .{ .index = 20, .len = 1 },
+                                },
+                            } },
+                            .location = .{ .index = 19, .len = 3 },
+                        },
+                    } },
+                    .location = .{ .index = 16, .len = 6 },
+                },
+            }},
+        } },
+        .location = .{ .index = 0, .len = 22 },
+    }, expr);
 }
 
 test "parse closure" {
@@ -1353,32 +1668,77 @@ test "parse closure" {
         \\times_n(4)
     ));
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .match = &.{
-        .subject = .{ .num = 2 },
-        .matchers = &.{.{
-            .pattern = .{ .name = "n" },
-            .expr = .{ .match = &.{
-                .subject = .{ .lambda = &.{
-                    .pattern = .{ .list = &.{
-                        .{ .name = "x" },
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .num = 2 },
+                .location = .{ .index = 4, .len = 1 },
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "n" },
+                    .location = .{ .index = 0, .len = 1 },
+                },
+                .expr = .{
+                    .data = .{ .match = &.{
+                        .subject = .{
+                            .data = .{ .lambda = &.{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "x" },
+                                            .location = .{ .index = 17, .len = 1 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 16, .len = 3 },
+                                },
+                                .expr = .{
+                                    .data = .{ .mul = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "x" },
+                                            .location = .{ .index = 20, .len = 1 },
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{ .index = 24, .len = 1 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 20, .len = 5 },
+                                },
+                            } },
+                            .location = .{ .index = 16, .len = 9 },
+                        },
+                        .matchers = &.{.{
+                            .pattern = .{
+                                .data = .{ .name = "times_n" },
+                                .location = .{ .index = 6, .len = 7 },
+                            },
+                            .expr = .{
+                                .data = .{ .call = &.{
+                                    .lhs = .{
+                                        .data = .{ .name = "times_n" },
+                                        .location = .{ .index = 26, .len = 7 },
+                                    },
+                                    .rhs = .{
+                                        .data = .{ .list = &.{
+                                            .{
+                                                .data = .{ .num = 4 },
+                                                .location = .{ .index = 34, .len = 1 },
+                                            },
+                                        } },
+                                        .location = .{ .index = 33, .len = 3 },
+                                    },
+                                } },
+                                .location = .{ .index = 26, .len = 10 },
+                            },
+                        }},
                     } },
-                    .expr = .{ .mul = &.{
-                        .lhs = .{ .name = "x" },
-                        .rhs = .{ .name = "n" },
-                    } },
-                } },
-                .matchers = &.{.{
-                    .pattern = .{ .name = "times_n" },
-                    .expr = .{ .call = &.{
-                        .lhs = .{ .name = "times_n" },
-                        .rhs = .{ .list = &.{
-                            .{ .num = 4 },
-                        } },
-                    } },
-                }},
-            } },
-        }},
-    } }, expr);
+                    .location = .{ .index = 6, .len = 30 },
+                },
+            }},
+        } },
+        .location = .{ .index = 0, .len = 36 },
+    }, expr);
 }
 
 test "parse dict" {
@@ -1387,22 +1747,76 @@ test "parse dict" {
         \\foo
     ));
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .match = &.{
-        .subject = .{ .dict = &.{
-            .{ .key = .{ .str = "foo" }, .value = .{ .num = 1 } },
-            .{ .key = .{ .str = "bar" }, .value = .{ .num = 2 } },
-            .{ .key = .{ .str = "baz" }, .value = .{ .num = 3 } },
-        } },
-        .matchers = &.{.{
-            .pattern = .{ .dicts = &.{
-                .{ .dict = &.{
-                    .{ .key = .{ .str = "foo" }, .value = .{ .name = "foo" } },
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .dict = &.{
+                    .{
+                        .key = .{
+                            .data = .{ .str = "foo" },
+                            .location = .{ .index = 21, .len = 5 },
+                        },
+                        .value = .{
+                            .data = .{ .num = 1 },
+                            .location = .{ .index = 29, .len = 1 },
+                        },
+                    },
+                    .{
+                        .key = .{
+                            .data = .{ .str = "bar" },
+                            .location = .{ .index = 32, .len = 5 },
+                        },
+                        .value = .{
+                            .data = .{ .num = 2 },
+                            .location = .{ .index = 40, .len = 1 },
+                        },
+                    },
+                    .{
+                        .key = .{
+                            .data = .{ .str = "baz" },
+                            .location = .{ .index = 43, .len = 5 },
+                        },
+                        .value = .{
+                            .data = .{ .num = 3 },
+                            .location = .{ .index = 51, .len = 1 },
+                        },
+                    },
                 } },
-                .ignore,
-            } },
-            .expr = .{ .name = "foo" },
-        }},
-    } }, expr);
+                .location = .{ .index = 20, .len = 33 },
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .dicts = &.{
+                        .{
+                            .data = .{ .dict = &.{
+                                .{
+                                    .key = .{
+                                        .data = .{ .str = "foo" },
+                                        .location = .{ .index = 1, .len = 5 },
+                                    },
+                                    .value = .{
+                                        .data = .{ .name = "foo" },
+                                        .location = .{ .index = 9, .len = 3 },
+                                    },
+                                },
+                            } },
+                            .location = .{ .index = 0, .len = 13 },
+                        },
+                        .{
+                            .data = .ignore,
+                            .location = .{ .index = 15, .len = 1 },
+                        },
+                    } },
+                    .location = .{ .index = 0, .len = 17 },
+                },
+                .expr = .{
+                    .data = .{ .name = "foo" },
+                    .location = .{ .index = 54, .len = 3 },
+                },
+            }},
+        } },
+        .location = .{ .index = 0, .len = 57 },
+    }, expr);
 }
 
 test "parse module" {
@@ -1412,76 +1826,187 @@ test "parse module" {
         \\pub fn fib(*args) match args do
         \\  [0, a, _] = a
         \\  [n, a, b] = fib(n - 1, b, a + b)
-        \\  [n]       = fib(n, A, B) 
+        \\  [n]       = fib(n, A, B)
         \\end
     ));
     defer expr.deinit(std.testing.allocator);
-    try std.testing.expectEqualDeep(Expr{ .module = &.{
-        .{
-            .fn_name = null,
-            .is_pub = false,
-            .pattern = .{ .name = "A" },
-            .subject = .{ .num = 0 },
-        },
-        .{
-            .fn_name = null,
-            .is_pub = false,
-            .pattern = .{ .name = "B" },
-            .subject = .{ .num = 1 },
-        },
-        .{
-            .fn_name = "fib",
-            .is_pub = true,
-            .pattern = .{ .lists = &.{
-                .{ .name = "args" },
-            } },
-            .subject = .{ .match = &.{
-                .subject = .{ .name = "args" },
-                .matchers = &.{
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .expr = &.{ .num = 0 } },
-                            .{ .name = "a" },
-                            .ignore,
-                        } },
-                        .expr = .{ .name = "a" },
-                    },
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .name = "n" },
-                            .{ .name = "a" },
-                            .{ .name = "b" },
-                        } },
-                        .expr = .{ .call = &.{
-                            .lhs = .{ .name = "fib" },
-                            .rhs = .{ .list = &.{
-                                .{ .sub = &.{
-                                    .lhs = .{ .name = "n" },
-                                    .rhs = .{ .num = 1 },
-                                } },
-                                .{ .name = "b" },
-                                .{ .add = &.{
-                                    .lhs = .{ .name = "a" },
-                                    .rhs = .{ .name = "b" },
-                                } },
-                            } },
-                        } },
-                    },
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .name = "n" },
-                        } },
-                        .expr = .{ .call = &.{
-                            .lhs = .{ .name = "fib" },
-                            .rhs = .{ .list = &.{
-                                .{ .name = "n" },
-                                .{ .name = "A" },
-                                .{ .name = "B" },
-                            } },
-                        } },
-                    },
+    try std.testing.expectEqualDeep(Expr{
+        .data = .{ .module = &.{
+            .{
+                .fn_name = null,
+                .is_pub = false,
+                .pattern = .{
+                    .data = .{ .name = "A" },
+                    .location = .{ .index = 0, .len = 1 },
                 },
-            } },
-        },
-    } }, expr);
+                .subject = .{
+                    .data = .{ .num = 0 },
+                    .location = .{ .index = 4, .len = 1 },
+                },
+            },
+            .{
+                .fn_name = null,
+                .is_pub = false,
+                .pattern = .{
+                    .data = .{ .name = "B" },
+                    .location = .{ .index = 6, .len = 1 },
+                },
+                .subject = .{
+                    .data = .{ .num = 1 },
+                    .location = .{ .index = 10, .len = 1 },
+                },
+            },
+            .{
+                .fn_name = "fib",
+                .is_pub = true,
+                .pattern = .{
+                    .data = .{ .lists = &.{
+                        .{
+                            .data = .{ .name = "args" },
+                            .location = .{ .index = 24, .len = 4 },
+                        },
+                    } },
+                    .location = .{ .index = 22, .len = 7 },
+                },
+                .subject = .{
+                    .data = .{ .match = &.{
+                        .subject = .{
+                            .data = .{ .name = "args" },
+                            .location = .{ .index = 36, .len = 4 },
+                        },
+                        .matchers = &.{
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .expr = &.{
+                                                .data = .{ .num = 0 },
+                                                .location = .{ .index = 47, .len = 1 },
+                                            } },
+                                            .location = .{ .index = 47, .len = 1 },
+                                        },
+                                        .{
+                                            .data = .{ .name = "a" },
+                                            .location = .{ .index = 50, .len = 1 },
+                                        },
+                                        .{
+                                            .data = .ignore,
+                                            .location = .{ .index = 53, .len = 1 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 46, .len = 9 },
+                                },
+                                .expr = .{
+                                    .data = .{ .name = "a" },
+                                    .location = .{ .index = 58, .len = 1 },
+                                },
+                            },
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{ .index = 63, .len = 1 },
+                                        },
+                                        .{
+                                            .data = .{ .name = "a" },
+                                            .location = .{ .index = 66, .len = 1 },
+                                        },
+                                        .{
+                                            .data = .{ .name = "b" },
+                                            .location = .{ .index = 69, .len = 1 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 62, .len = 9 },
+                                },
+                                .expr = .{
+                                    .data = .{ .call = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "fib" },
+                                            .location = .{ .index = 74, .len = 3 },
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .list = &.{
+                                                .{
+                                                    .data = .{ .sub = &.{
+                                                        .lhs = .{
+                                                            .data = .{ .name = "n" },
+                                                            .location = .{ .index = 78, .len = 1 },
+                                                        },
+                                                        .rhs = .{
+                                                            .data = .{ .num = 1 },
+                                                            .location = .{ .index = 82, .len = 1 },
+                                                        },
+                                                    } },
+                                                    .location = .{ .index = 78, .len = 5 },
+                                                },
+                                                .{
+                                                    .data = .{ .name = "b" },
+                                                    .location = .{ .index = 85, .len = 1 },
+                                                },
+                                                .{
+                                                    .data = .{ .add = &.{
+                                                        .lhs = .{
+                                                            .data = .{ .name = "a" },
+                                                            .location = .{ .index = 88, .len = 1 },
+                                                        },
+                                                        .rhs = .{
+                                                            .data = .{ .name = "b" },
+                                                            .location = .{ .index = 92, .len = 1 },
+                                                        },
+                                                    } },
+                                                    .location = .{ .index = 88, .len = 5 },
+                                                },
+                                            } },
+                                            .location = .{ .index = 77, .len = 17 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 74, .len = 20 },
+                                },
+                            },
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{ .index = 98, .len = 1 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 97, .len = 3 },
+                                },
+                                .expr = .{
+                                    .data = .{ .call = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "fib" },
+                                            .location = .{ .index = 109, .len = 3 },
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .list = &.{
+                                                .{
+                                                    .data = .{ .name = "n" },
+                                                    .location = .{ .index = 113, .len = 1 },
+                                                },
+                                                .{
+                                                    .data = .{ .name = "A" },
+                                                    .location = .{ .index = 116, .len = 1 },
+                                                },
+                                                .{
+                                                    .data = .{ .name = "B" },
+                                                    .location = .{ .index = 119, .len = 1 },
+                                                },
+                                            } },
+                                            .location = .{ .index = 112, .len = 9 },
+                                        },
+                                    } },
+                                    .location = .{ .index = 109, .len = 12 },
+                                },
+                            },
+                        },
+                    } },
+                    .location = .{ .index = 30, .len = 95 },
+                },
+            },
+        } },
+        .location = .{ .index = 0, .len = 125 },
+    }, expr);
 }

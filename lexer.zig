@@ -207,11 +207,14 @@ pub const Lexer = struct {
     }
 
     pub fn getPos(self: *const Lexer, token: Token) Pos {
-        const index = @intFromPtr(token.content.ptr) - @intFromPtr(self.content.ptr);
-        return self.getIndexPos(index);
+        return self.getIndexPos(self.getIndex(token));
     }
 
-    fn getIndexPos(self: *const Lexer, index: usize) Pos {
+    pub fn getIndex(self: *const Lexer, token: Token) usize {
+        return @intFromPtr(token.content.ptr) - @intFromPtr(self.content.ptr);
+    }
+
+    pub fn getIndexPos(self: *const Lexer, index: usize) Pos {
         var pos = Pos{ .line = 1, .column = 1 };
         for (self.content[0..index]) |char| {
             if (char == '\n') {

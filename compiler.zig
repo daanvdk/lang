@@ -18,7 +18,9 @@ pub fn compile(allocator: std.mem.Allocator, expr: Expr) Compiler.Error!Program 
     const data = try buffer.content.toOwnedSlice();
     errdefer allocator.free(data);
     const instrs = try compiler.instrs.toOwnedSlice();
-    return .{ .instrs = instrs, .data = data };
+    errdefer allocator.free(instrs);
+    const locations = try compiler.locations.toOwnedSlice();
+    return .{ .instrs = instrs, .data = data, .locations = locations };
 }
 
 pub const Buffer = struct {
@@ -44,6 +46,7 @@ pub const Buffer = struct {
 pub const Compiler = struct {
     buffer: *Buffer,
     instrs: std.ArrayList(Instr),
+    locations: std.ArrayList(Program.Location),
     stack: Stack,
     scope: std.StringHashMap(Info),
     caps: std.ArrayList(Cap),
@@ -55,6 +58,7 @@ pub const Compiler = struct {
         return .{
             .buffer = buffer,
             .instrs = std.ArrayList(Instr).init(buffer.content.allocator),
+            .locations = std.ArrayList(Program.Location).init(buffer.content.allocator),
             .stack = Stack.init(buffer.content.allocator),
             .scope = std.StringHashMap(Info).init(buffer.content.allocator),
             .caps = std.ArrayList(Cap).init(buffer.content.allocator),
@@ -63,13 +67,14 @@ pub const Compiler = struct {
 
     pub fn deinit(self: *Compiler) void {
         self.instrs.deinit();
+        self.locations.deinit();
         self.stack.deinit();
         self.scope.deinit();
         self.caps.deinit();
     }
 
     pub fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
-        switch (expr) {
+        switch (expr.data) {
             .global => |global| {
                 try self.instrs.append(.{ .global = global });
                 try self.compileUsage(usage);
@@ -120,13 +125,17 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .any;
             },
-            .list => return try self.compileExpr(.{ .lists = &.{expr} }, usage),
-            .lists => |cols| {
+            inline .list, .lists => |value, tag| {
+                const cols: []const Expr = switch (tag) {
+                    .list => &.{expr},
+                    .lists => value,
+                    else => unreachable,
+                };
                 const start = self.stack.size();
 
                 var i: usize = 0;
-                while (i < cols.len and cols[i] == .list) : (i += 1) {
-                    for (cols[i].list) |item| {
+                while (i < cols.len and cols[i].data == .list) : (i += 1) {
+                    for (cols[i].data.list) |item| {
                         _ = try self.compileExpr(item, .used);
                         try self.stack.push(null);
                     }
@@ -157,10 +166,19 @@ pub const Compiler = struct {
                         }
                     },
                     else => {
-                        _ = try self.compileExpr(.{ .call = &.{
-                            .lhs = .{ .global = .list },
-                            .rhs = .{ .list = cols[i..] },
-                        } }, .used);
+                        _ = try self.compileExpr(.{
+                            .data = .{ .call = &.{
+                                .lhs = .{
+                                    .data = .{ .global = .list },
+                                    .location = .{},
+                                },
+                                .rhs = .{
+                                    .data = .{ .list = cols[i..] },
+                                    .location = .{},
+                                },
+                            } },
+                            .location = .{},
+                        }, .used);
                     },
                 }
 
@@ -172,10 +190,14 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .list;
             },
-            .dict => return try self.compileExpr(.{ .dicts = &.{expr} }, usage),
-            .dicts => |cols| {
+            inline .dict, .dicts => |value, tag| {
+                const cols: []const Expr = switch (tag) {
+                    .dict => &.{expr},
+                    .dicts => value,
+                    else => unreachable,
+                };
                 var n = cols.len;
-                while (n > 0 and cols[n - 1] == .dict) n -= 1;
+                while (n > 0 and cols[n - 1].data == .dict) n -= 1;
 
                 switch (n) {
                     0 => try self.instrs.append(.empty_dict),
@@ -202,16 +224,25 @@ pub const Compiler = struct {
                         }
                     },
                     else => {
-                        _ = try self.compileExpr(.{ .call = &.{
-                            .lhs = .{ .global = .dict },
-                            .rhs = .{ .list = cols[0..n] },
-                        } }, .used);
+                        _ = try self.compileExpr(.{
+                            .data = .{ .call = &.{
+                                .lhs = .{
+                                    .data = .{ .global = .dict },
+                                    .location = .{},
+                                },
+                                .rhs = .{
+                                    .data = .{ .list = cols[0..n] },
+                                    .location = .{},
+                                },
+                            } },
+                            .location = .{},
+                        }, .used);
                     },
                 }
 
                 try self.stack.push(null);
                 for (cols[n..]) |col| {
-                    for (col.dict) |pair| {
+                    for (col.data.dict) |pair| {
                         _ = try self.compileExpr(pair.key, .used);
                         try self.stack.push(null);
                         _ = try self.compileExpr(pair.value, .used);
@@ -237,11 +268,20 @@ pub const Compiler = struct {
                 _ = try compiler.compileMatcher(switch (tag) {
                     .lambda => value.*,
                     .gen => .{
-                        .pattern = .{ .list = &.{.{ .expr = &.null }} },
+                        .pattern = .{
+                            .data = .{ .list = &.{.{
+                                .data = .{ .expr = &.{
+                                    .data = .null,
+                                    .location = .{},
+                                } },
+                                .location = .{},
+                            }} },
+                            .location = .{},
+                        },
                         .expr = value.*,
                     },
                     else => unreachable,
-                }, .list, null, .returned);
+                }, .list, null, .{}, .returned);
 
                 var caps = std.StringHashMap(usize).init(self.instrs.allocator);
                 defer caps.deinit();
@@ -250,7 +290,10 @@ pub const Compiler = struct {
                     const res = try caps.getOrPut(cap.name);
                     if (res.found_existing) continue;
 
-                    _ = try self.compileExpr(.{ .name = cap.name }, .used);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .name = cap.name },
+                        .location = .{},
+                    }, .used);
                     res.value_ptr.* = caps.count() - 1;
                 }
 
@@ -271,7 +314,15 @@ pub const Compiler = struct {
                     .caps = caps.count(),
                     .len = @truncate(compiler.instrs.items.len),
                 } });
+
+                try self.locations.ensureUnusedCapacity(compiler.locations.items.len);
+                for (compiler.locations.items) |location| self.locations.appendAssumeCapacity(.{
+                    .offset = location.offset + self.instrs.items.len,
+                    .index = location.index,
+                    .location = location.location,
+                });
                 try self.instrs.appendSlice(compiler.instrs.items);
+
                 try self.compileUsage(usage);
                 return .any;
             },
@@ -283,6 +334,8 @@ pub const Compiler = struct {
                 if (tag == .call and usage == .returned and !self.is_gen) {
                     try self.instrs.append(.tail_call);
                 } else {
+                    try self.appendLocation(bin.lhs.location);
+                    try self.appendLocation(bin.rhs.location);
                     try self.instrs.append(@field(Instr, @tagName(tag)));
                     try self.compileUsage(usage);
                 }
@@ -290,6 +343,7 @@ pub const Compiler = struct {
             },
             inline .pos, .neg, .not => |expr_ptr, tag| {
                 _ = try self.compileExpr(expr_ptr.*, .used);
+                try self.appendLocation(expr_ptr.location);
                 try self.instrs.append(@field(Instr, @tagName(tag)));
                 try self.compileUsage(usage);
                 return .any;
@@ -371,7 +425,7 @@ pub const Compiler = struct {
                 var n: usize = 0;
                 const no_match: ?Expr = while (n < match.matchers.len) : (n += 1) {
                     const matcher = match.matchers[n];
-                    if (matcher.pattern == .ignore) break matcher.expr;
+                    if (matcher.pattern.data == .ignore) break matcher.expr;
                 } else null;
 
                 if (n == 0) {
@@ -401,7 +455,13 @@ pub const Compiler = struct {
 
                     var to_next = std.ArrayList(usize).init(self.instrs.allocator);
                     defer to_next.deinit();
-                    info = info.merge(try self.compileMatcher(matcher, subject_info, if (has_next) &to_next else null, usage));
+                    info = info.merge(try self.compileMatcher(
+                        matcher,
+                        subject_info,
+                        if (has_next) &to_next else null,
+                        match.subject.location,
+                        usage,
+                    ));
 
                     if (has_next_matcher) {
                         self.stack.pop();
@@ -455,7 +515,13 @@ pub const Compiler = struct {
                 try self.instrs.append(.yield);
 
                 const start = self.stack.size();
-                try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .list, null, start);
+                try self.compilePattern(.{
+                    .data = .{ .list = &.{.{
+                        .data = .{ .name = "value" },
+                        .location = .{},
+                    }} },
+                    .location = .{},
+                }, .list, null, start, expr_ptr.location);
                 self.stack.entries.shrinkRetainingCapacity(start);
 
                 try self.compileUsage(usage);
@@ -486,7 +552,16 @@ pub const Compiler = struct {
 
                 try self.instrs.append(.call);
                 const start = self.stack.size();
-                try self.compilePattern(.{ .list = &.{ .{ .name = "head" }, .{ .name = "tail" } } }, .any, null, start);
+                try self.compilePattern(.{
+                    .data = .{ .list = &.{ .{
+                        .data = .{ .name = "head" },
+                        .location = .{},
+                    }, .{
+                        .data = .{ .name = "tail" },
+                        .location = .{},
+                    } } },
+                    .location = .{},
+                }, .any, null, start, .{});
                 self.stack.entries.shrinkRetainingCapacity(start);
                 try self.instrs.append(.{ .local = start + 1 });
                 try self.instrs.append(.null);
@@ -504,11 +579,17 @@ pub const Compiler = struct {
 
                 switch (tag) {
                     .@"for" => {
-                        _ = try self.compileMatcher(value.matcher, .any, null, .used);
+                        _ = try self.compileMatcher(value.matcher, .any, null, value.subject.location, .used);
                     },
                     .yield_all => {
                         try self.instrs.append(.yield);
-                        try self.compilePattern(.{ .list = &.{.{ .name = "value" }} }, .any, null, start + 2);
+                        try self.compilePattern(.{
+                            .data = .{ .list = &.{.{
+                                .data = .{ .name = "value" },
+                                .location = .{},
+                            }} },
+                            .location = .{},
+                        }, .any, null, start + 2, .{});
                         self.stack.entries.shrinkRetainingCapacity(start + 2);
                     },
                     else => unreachable,
@@ -534,8 +615,12 @@ pub const Compiler = struct {
             .assert => |expr_ptr| {
                 _ = try self.compileExpr(expr_ptr.*, .used);
                 try self.instrs.append(.{ .jmp_if = 1 });
+                try self.appendLocation(expr_ptr.location);
                 try self.instrs.append(.no_match);
-                return try self.compileExpr(.null, usage);
+                return try self.compileExpr(.{
+                    .data = .null,
+                    .location = .{},
+                }, usage);
             },
             .module => |stmts| {
                 const allocator = self.instrs.allocator;
@@ -584,15 +669,33 @@ pub const Compiler = struct {
                     const offset = self.stack.size() - 1;
 
                     if (stmt.fn_name) |fn_name| {
-                        try self.putMod(&mod_exprs, &mod_expr_indexes, fn_name, .{ .call = &.{
-                            .lhs = .{ .get = &.{
-                                .lhs = .{ .name = "@module" },
-                                .rhs = .{ .str = fn_keys.get(fn_name).? },
+                        try self.putMod(&mod_exprs, &mod_expr_indexes, fn_name, .{
+                            .data = .{ .call = &.{
+                                .lhs = .{
+                                    .data = .{ .get = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "@module" },
+                                            .location = .{},
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .str = fn_keys.get(fn_name).? },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .rhs = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "@module" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
                             } },
-                            .rhs = .{ .list = &.{
-                                .{ .name = "@module" },
-                            } },
-                        } });
+                            .location = .{},
+                        });
                         if (stmt.is_pub) try putPub(&pub_exprs, &pub_expr_indexes, fn_name, null);
                     } else {
                         var subject = try stmt.subject.clone(allocator);
@@ -606,17 +709,29 @@ pub const Compiler = struct {
 
                             const matchers = try allocator.alloc(Expr.Matcher, 1);
                             errdefer allocator.free(matchers);
-                            matchers[0] = .{ .pattern = .{ .name = mod_expr.name }, .expr = subject };
+                            matchers[0] = .{
+                                .pattern = .{
+                                    .data = .{ .name = mod_expr.name },
+                                    .location = .{},
+                                },
+                                .expr = subject,
+                            };
 
                             const match = try allocator.create(Expr.Match);
                             errdefer allocator.destroy(match);
-                            match.* = .{ .subject = try mod_expr.expr.clone(allocator), .matchers = matchers };
+                            match.* = .{
+                                .subject = try mod_expr.expr.clone(allocator),
+                                .matchers = matchers,
+                            };
 
-                            subject = .{ .match = match };
+                            subject = .{
+                                .data = .{ .match = match },
+                                .location = .{},
+                            };
                         }
 
                         const info = try self.compileExpr(subject, .used);
-                        try self.compilePattern(stmt.pattern, info, null, offset + 1);
+                        try self.compilePattern(stmt.pattern, info, null, offset + 1, .{});
 
                         if (offset < self.stack.size() - 1) {
                             try self.instrs.append(.{ .local = offset });
@@ -628,14 +743,26 @@ pub const Compiler = struct {
                         for (offset.., self.stack.entries.items[offset .. self.stack.size() - 1]) |index, maybe_entry| {
                             const entry = maybe_entry orelse continue;
 
-                            _ = try self.compileExpr(.{ .str = entry.name }, .used);
+                            _ = try self.compileExpr(.{
+                                .data = .{ .str = entry.name },
+                                .location = .{},
+                            }, .used);
                             try self.instrs.append(.{ .local = index });
                             try self.instrs.append(.put_dict);
 
-                            try self.putMod(&mod_exprs, &mod_expr_indexes, entry.name, .{ .get = &.{
-                                .lhs = .{ .name = "@module" },
-                                .rhs = .{ .str = entry.name },
-                            } });
+                            try self.putMod(&mod_exprs, &mod_expr_indexes, entry.name, .{
+                                .data = .{ .get = &.{
+                                    .lhs = .{
+                                        .data = .{ .name = "@module" },
+                                        .location = .{},
+                                    },
+                                    .rhs = .{
+                                        .data = .{ .str = entry.name },
+                                        .location = .{},
+                                    },
+                                } },
+                                .location = .{},
+                            });
                             if (stmt.is_pub) try putPub(&pub_exprs, &pub_expr_indexes, entry.name, index);
                         }
                     }
@@ -645,20 +772,41 @@ pub const Compiler = struct {
                 try self.instrs.append(.empty_dict);
                 try self.stack.push(null);
                 for (pub_exprs.items) |pub_expr| {
-                    _ = try self.compileExpr(.{ .str = pub_expr.name }, .used);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = pub_expr.name },
+                        .location = .{},
+                    }, .used);
                     if (pub_expr.index) |local| {
                         try self.instrs.append(.{ .local = local });
                     } else {
                         try self.stack.push(null);
-                        _ = try self.compileExpr(.{ .call = &.{
-                            .lhs = .{ .get = &.{
-                                .lhs = .{ .name = "@module" },
-                                .rhs = .{ .str = fn_keys.get(pub_expr.name).? },
+                        _ = try self.compileExpr(.{
+                            .data = .{ .call = &.{
+                                .lhs = .{
+                                    .data = .{ .get = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "@module" },
+                                            .location = .{},
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .str = fn_keys.get(pub_expr.name).? },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .rhs = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "@module" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
                             } },
-                            .rhs = .{ .list = &.{
-                                .{ .name = "@module" },
-                            } },
-                        } }, .used);
+                            .location = .{},
+                        }, .used);
                         self.stack.pop();
                     }
                     try self.instrs.append(.put_dict);
@@ -675,13 +823,19 @@ pub const Compiler = struct {
                     const fn_name = stmt.fn_name orelse continue;
                     const fn_key = fn_keys.get(fn_name).?;
 
-                    var body = try (Expr{ .match = &.{
-                        .subject = .{ .name = "@args" },
-                        .matchers = &.{.{
-                            .pattern = stmt.pattern,
-                            .expr = stmt.subject,
-                        }},
-                    } }).clone(allocator);
+                    var body = try (Expr{
+                        .data = .{ .match = &.{
+                            .subject = .{
+                                .data = .{ .name = "@args" },
+                                .location = .{},
+                            },
+                            .matchers = &.{.{
+                                .pattern = stmt.pattern,
+                                .expr = stmt.subject,
+                            }},
+                        } },
+                        .location = .{},
+                    }).clone(allocator);
                     defer body.deinit(allocator);
 
                     // Wrap with all things used from the module
@@ -693,30 +847,57 @@ pub const Compiler = struct {
 
                         const matchers = try allocator.alloc(Expr.Matcher, 1);
                         errdefer allocator.free(matchers);
-                        matchers[0] = .{ .pattern = .{ .name = entry.name }, .expr = body };
+                        matchers[0] = .{
+                            .pattern = .{
+                                .data = .{ .name = entry.name },
+                                .location = .{},
+                            },
+                            .expr = body,
+                        };
 
                         const match = try allocator.create(Expr.Match);
                         errdefer allocator.destroy(match);
                         match.subject = try entry.expr.clone(allocator);
                         match.matchers = matchers;
 
-                        body = .{ .match = match };
+                        body = .{
+                            .data = .{ .match = match },
+                            .location = .{},
+                        };
                     }
 
                     // Compile fn
                     const fn_start = self.instrs.items.len;
                     try self.stack.push(.{ .name = "@module", .info = .dict });
-                    _ = try self.compileExpr(.{ .str = fn_key }, .used);
+                    _ = try self.compileExpr(.{
+                        .data = .{ .str = fn_key },
+                        .location = .{},
+                    }, .used);
                     try self.stack.push(null);
-                    _ = try self.compileExpr(.{ .lambda = &.{
-                        .pattern = .{ .list = &.{
-                            .{ .name = "@module" },
+                    _ = try self.compileExpr(.{
+                        .data = .{ .lambda = &.{
+                            .pattern = .{
+                                .data = .{ .list = &.{
+                                    .{
+                                        .data = .{ .name = "@module" },
+                                        .location = .{},
+                                    },
+                                } },
+                                .location = .{},
+                            },
+                            .expr = .{
+                                .data = .{ .lambda = &.{
+                                    .pattern = .{
+                                        .data = .{ .name = "@args" },
+                                        .location = .{},
+                                    },
+                                    .expr = body,
+                                } },
+                                .location = .{},
+                            },
                         } },
-                        .expr = .{ .lambda = &.{
-                            .pattern = .{ .name = "@args" },
-                            .expr = body,
-                        } },
-                    } }, .used);
+                        .location = .{},
+                    }, .used);
                     self.stack.pop();
                     self.stack.pop();
                     try self.instrs.append(.put_dict);
@@ -788,13 +969,14 @@ pub const Compiler = struct {
         info: Info,
         to_next: ?*std.ArrayList(usize),
         start: usize,
+        location: Instr.Location,
     ) Error!void {
-        switch (pattern) {
+        switch (pattern.data) {
             .name => |name| {
                 if (self.stack.getFromIndex(start, name)) |local| {
                     try self.instrs.append(.{ .local = local.index });
                     try self.instrs.append(.eq);
-                    try self.compileNoMatch(true, to_next, start, 0);
+                    try self.compileNoMatch(true, to_next, start, 0, location);
                 } else {
                     try self.stack.push(.{ .name = name, .info = info });
                 }
@@ -811,34 +993,39 @@ pub const Compiler = struct {
                 _ = try self.compileExpr(expr.*, .used);
                 self.stack.pop();
                 try self.instrs.append(.eq);
-                try self.compileNoMatch(true, to_next, start, 0);
+                try self.compileNoMatch(true, to_next, start, 0, location);
             },
             .guard => |guard| {
-                try self.compilePattern(guard.pattern, info, to_next, start);
+                try self.compilePattern(guard.pattern, info, to_next, start, location);
                 _ = try self.compileExpr(guard.cond, .used);
-                try self.compileNoMatch(true, to_next, start, 0);
+                try self.compileNoMatch(true, to_next, start, 0, location);
             },
-            .list => try self.compilePattern(.{ .lists = &.{pattern} }, info, to_next, start),
-            .lists => |cols| {
+            inline .list, .lists => |value, tag| {
+                const cols: []const Pattern = switch (tag) {
+                    .list => &.{pattern},
+                    .lists => value,
+                    else => unreachable,
+                };
+
                 if (!info.isList()) {
                     try self.instrs.append(.{ .global = .is_list });
                     try self.instrs.append(.{ .local = self.stack.size() });
                     try self.instrs.append(.nil);
                     try self.instrs.append(.cons);
                     try self.instrs.append(.call);
-                    try self.compileNoMatch(true, to_next, start, 1);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
                 }
 
                 var i: usize = 0;
-                while (i < cols.len and cols[i] == .list) : (i += 1) {
-                    for (cols[i].list) |item| {
+                while (i < cols.len and cols[i].data == .list) : (i += 1) {
+                    for (cols[i].data.list) |item| {
                         try self.instrs.append(.{ .local = self.stack.size() });
-                        try self.compileNoMatch(true, to_next, start, 1);
+                        try self.compileNoMatch(true, to_next, start, 1, location);
                         try self.instrs.append(.decons);
 
-                        if (item == .name and self.stack.getFromIndex(start, item.name) == null) {
-                            try self.stack.push(.{ .name = item.name, .info = .any });
-                        } else if (item == .ignore) {
+                        if (item.data == .name and self.stack.getFromIndex(start, item.data.name) == null) {
+                            try self.stack.push(.{ .name = item.data.name, .info = .any });
+                        } else if (item.data == .ignore) {
                             try self.instrs.append(.{ .pop = self.stack.size() });
                         } else {
                             const curr = self.stack.size();
@@ -846,7 +1033,7 @@ pub const Compiler = struct {
                             try self.instrs.append(.{ .pop = curr });
 
                             try self.stack.push(null);
-                            try self.compilePattern(item, .any, to_next, start);
+                            try self.compilePattern(item, .any, to_next, start, location);
                             _ = self.stack.entries.orderedRemove(start);
 
                             if (self.stack.size() != curr) {
@@ -858,25 +1045,30 @@ pub const Compiler = struct {
                 }
 
                 switch (cols.len - i) {
-                    0 => try self.compileNoMatch(false, to_next, start, 0),
-                    1 => try self.compilePattern(cols[i], .list, to_next, start),
+                    0 => try self.compileNoMatch(false, to_next, start, 0, location),
+                    1 => try self.compilePattern(cols[i], .list, to_next, start, location),
                     else => unreachable,
                 }
             },
-            .dict => try self.compilePattern(.{ .dicts = &.{pattern} }, info, to_next, start),
-            .dicts => |cols| {
+            inline .dict, .dicts => |value, tag| {
+                const cols: []const Pattern = switch (tag) {
+                    .dict => &.{pattern},
+                    .dicts => value,
+                    else => unreachable,
+                };
+
                 if (!info.isDict()) {
                     try self.instrs.append(.{ .global = .is_dict });
                     try self.instrs.append(.{ .local = self.stack.size() });
                     try self.instrs.append(.nil);
                     try self.instrs.append(.cons);
                     try self.instrs.append(.call);
-                    try self.compileNoMatch(true, to_next, start, 1);
+                    try self.compileNoMatch(true, to_next, start, 1, location);
                 }
 
                 var i: usize = 0;
-                while (i < cols.len and cols[i] == .dict) : (i += 1) {
-                    for (cols[i].dict) |item| {
+                while (i < cols.len and cols[i].data == .dict) : (i += 1) {
+                    for (cols[i].data.dict) |item| {
                         try self.stack.push(null);
                         _ = try self.compileExpr(item.key, .used);
                         self.stack.pop();
@@ -884,12 +1076,12 @@ pub const Compiler = struct {
                         try self.instrs.append(.{ .local = self.stack.size() + 1 });
                         try self.instrs.append(.{ .local = self.stack.size() });
                         try self.instrs.append(.in);
-                        try self.compileNoMatch(true, to_next, start, 2);
+                        try self.compileNoMatch(true, to_next, start, 2, location);
                         try self.instrs.append(.pop_dict);
 
-                        if (item.value == .name and self.stack.getFromIndex(start, item.value.name) == null) {
-                            try self.stack.push(.{ .name = item.value.name, .info = .any });
-                        } else if (item.value == .ignore) {
+                        if (item.value.data == .name and self.stack.getFromIndex(start, item.value.data.name) == null) {
+                            try self.stack.push(.{ .name = item.value.data.name, .info = .any });
+                        } else if (item.value.data == .ignore) {
                             try self.instrs.append(.{ .pop = self.stack.size() });
                         } else {
                             const curr = self.stack.size();
@@ -897,7 +1089,7 @@ pub const Compiler = struct {
                             try self.instrs.append(.{ .pop = curr });
 
                             try self.stack.push(null);
-                            try self.compilePattern(item.value, .any, to_next, start);
+                            try self.compilePattern(item.value, .any, to_next, start, location);
                             _ = self.stack.entries.orderedRemove(start);
 
                             if (self.stack.size() != curr) {
@@ -909,8 +1101,8 @@ pub const Compiler = struct {
                 }
 
                 switch (cols.len - i) {
-                    0 => try self.compileNoMatch(false, to_next, start, 0),
-                    1 => try self.compilePattern(cols[i], .dict, to_next, start),
+                    0 => try self.compileNoMatch(false, to_next, start, 0, location),
+                    1 => try self.compilePattern(cols[i], .dict, to_next, start, location),
                     else => unreachable,
                 }
             },
@@ -923,6 +1115,7 @@ pub const Compiler = struct {
         to_next: ?*std.ArrayList(usize),
         start: usize,
         extra: usize,
+        location: Instr.Location,
     ) Error!void {
         var end = self.stack.size() + extra;
         const jmp = end - start + 1;
@@ -940,6 +1133,7 @@ pub const Compiler = struct {
         }
 
         if (to_next) |to_next_| try to_next_.append(self.instrs.items.len);
+        try self.appendLocation(location);
         try self.instrs.append(.no_match);
     }
 
@@ -948,11 +1142,12 @@ pub const Compiler = struct {
         matcher: Expr.Matcher,
         subject_info: Info,
         to_next: ?*std.ArrayList(usize),
+        location: Instr.Location,
         usage: Usage,
     ) Error!Info {
         const start = self.stack.size();
 
-        try self.compilePattern(matcher.pattern, subject_info, to_next, start);
+        try self.compilePattern(matcher.pattern, subject_info, to_next, start, location);
         const info = try self.compileExpr(matcher.expr, usage);
 
         while (self.stack.size() > start) {
@@ -963,8 +1158,25 @@ pub const Compiler = struct {
         return info;
     }
 
+    fn appendLocation(self: *Compiler, location: Instr.Location) !void {
+        if (location.index == 0 and location.len == 0) return;
+
+        const locations = self.locations.items;
+        const offset = self.instrs.items.len;
+
+        var index: usize = 0;
+        while (index < locations.len and locations[locations.len - 1 - index].offset == offset) index += 1;
+
+        try self.locations.append(.{
+            .offset = offset,
+            .index = index,
+            .location = location,
+        });
+    }
+
     fn insertInstr(self: *Compiler, index: usize, instr: Instr) !void {
         try self.instrs.insert(index, instr);
+
         var i = self.caps.items.len;
         while (i > 0) {
             i -= 1;
@@ -972,37 +1184,76 @@ pub const Compiler = struct {
             if (cap.index < index) break;
             cap.index += 1;
         }
+
+        i = self.locations.items.len;
+        while (i > 0) {
+            i -= 1;
+            const location = &self.locations.items[i];
+            if (location.index < index) break;
+            location.index += 1;
+        }
     }
 
     fn moveInstrs(self: *Compiler, old_index: usize, new_index: usize, len: usize) !void {
-        const caps_old_index = self.findCaps(old_index);
-        const caps_new_index = self.findCaps(new_index);
-        const caps_len = self.findCaps(old_index + len) - caps_old_index;
+        const allocator = self.instrs.allocator;
+        try moveItems(Instr, allocator, self.instrs.items, old_index, new_index, len);
+        try moveIndexedItems(Cap, allocator, self.caps.items, "index", old_index, new_index, len);
+        try moveIndexedItems(Program.Location, allocator, self.locations.items, "offset", old_index, new_index, len);
+    }
 
-        try moveSlice(Instr, self.instrs, old_index, new_index, len);
-        try moveSlice(Cap, self.caps, caps_old_index, caps_new_index, caps_len);
+    fn moveItems(comptime T: type, allocator: std.mem.Allocator, items: []T, old_index: usize, new_index: usize, len: usize) !void {
+        if (old_index == new_index or len == 0) return;
 
-        if (caps_old_index < caps_new_index) {
-            for (self.caps.items[caps_old_index..caps_new_index]) |*cap| {
-                cap.index -= len;
+        const data = try allocator.dupe(T, items[old_index .. old_index + len]);
+        defer allocator.free(data);
+
+        if (old_index < new_index) {
+            std.mem.copyForwards(
+                T,
+                items[old_index..new_index],
+                items[old_index + len .. new_index + len],
+            );
+        } else {
+            std.mem.copyBackwards(
+                T,
+                items[new_index + len .. old_index + len],
+                items[new_index..old_index],
+            );
+        }
+        @memcpy(items[new_index .. new_index + len], data);
+    }
+
+    fn moveIndexedItems(comptime T: type, allocator: std.mem.Allocator, items: []T, comptime field: []const u8, old_index: usize, new_index: usize, len: usize) !void {
+        const item_old_index = findIndex(T, items, field, old_index);
+        const item_new_index = findIndex(T, items, field, new_index);
+        const item_len = findIndex(T, items, field, old_index + len) - item_old_index;
+
+        try moveItems(T, allocator, items, item_old_index, item_new_index, item_len);
+
+        if (old_index < new_index) {
+            for (items[item_old_index..item_new_index]) |*item| {
+                @field(item, field) -= len;
+            }
+            for (items[item_new_index .. item_new_index + item_len]) |*item| {
+                @field(item, field) += new_index - old_index;
             }
         } else {
-            for (self.caps.items[caps_new_index + caps_len .. caps_old_index + caps_len]) |*cap| {
-                cap.index += len;
+            for (items[item_new_index .. item_new_index + item_len]) |*item| {
+                @field(item, field) -= old_index - new_index;
             }
-        }
-        for (self.caps.items[caps_new_index .. caps_new_index + caps_len]) |*cap| {
-            cap.index += new_index - old_index;
+            for (items[item_new_index + item_len .. item_old_index + item_len]) |*item| {
+                @field(item, field) += len;
+            }
         }
     }
 
-    fn findCaps(self: *Compiler, instr_index: usize) usize {
+    fn findIndex(comptime T: type, items: []T, comptime field: []const u8, instr_index: usize) usize {
         var min_index: usize = 0;
-        var max_index = self.caps.items.len;
+        var max_index = items.len;
 
         while (min_index != max_index) {
             const mid_index = (min_index + max_index) / 2;
-            if (instr_index <= self.caps.items[mid_index].index) {
+            if (instr_index <= @field(items[mid_index], field)) {
                 max_index = mid_index;
             } else {
                 min_index = mid_index + 1;
@@ -1010,28 +1261,6 @@ pub const Compiler = struct {
         }
 
         return min_index;
-    }
-
-    fn moveSlice(comptime T: type, list: std.ArrayList(T), old_index: usize, new_index: usize, len: usize) !void {
-        if (old_index == new_index or len == 0) return;
-
-        const data = try list.allocator.dupe(T, list.items[old_index .. old_index + len]);
-        defer list.allocator.free(data);
-
-        if (old_index < new_index) {
-            std.mem.copyForwards(
-                T,
-                list.items[old_index..new_index],
-                list.items[old_index + len .. new_index + len],
-            );
-        } else {
-            std.mem.copyBackwards(
-                T,
-                list.items[new_index + len .. old_index + len],
-                list.items[new_index..old_index],
-            );
-        }
-        @memcpy(list.items[new_index .. new_index + len], data);
     }
 };
 
@@ -1126,7 +1355,10 @@ const PubExpr = struct {
 };
 
 test "compile num 1" {
-    const program = try compile(std.testing.allocator, .{ .num = 1337 });
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .num = 1337 },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1136,7 +1368,10 @@ test "compile num 1" {
 }
 
 test "compile num 2" {
-    const program = try compile(std.testing.allocator, .{ .num = 45.67 });
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .num = 45.67 },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1146,7 +1381,10 @@ test "compile num 2" {
 }
 
 test "compile bool 1" {
-    const program = try compile(std.testing.allocator, .{ .bool = true });
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .bool = true },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1156,7 +1394,10 @@ test "compile bool 1" {
 }
 
 test "compile bool 2" {
-    const program = try compile(std.testing.allocator, .{ .bool = false });
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .bool = false },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1166,7 +1407,10 @@ test "compile bool 2" {
 }
 
 test "compile null" {
-    const program = try compile(std.testing.allocator, .null);
+    const program = try compile(std.testing.allocator, .{
+        .data = .null,
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1176,16 +1420,40 @@ test "compile null" {
 }
 
 test "compile operators" {
-    const program = try compile(std.testing.allocator, .{ .add = &.{
-        .lhs = .{ .mul = &.{
-            .lhs = .{ .num = 1 },
-            .rhs = .{ .num = 2 },
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .add = &.{
+            .lhs = .{
+                .data = .{ .mul = &.{
+                    .lhs = .{
+                        .data = .{ .num = 1 },
+                        .location = .{ .index = 0, .len = 1 },
+                    },
+                    .rhs = .{
+                        .data = .{ .num = 2 },
+                        .location = .{ .index = 4, .len = 1 },
+                    },
+                } },
+                .location = .{ .index = 0, .len = 5 },
+            },
+            .rhs = .{
+                .data = .{ .div = &.{
+                    .lhs = .{
+                        .data = .{ .num = 3 },
+                        .location = .{ .index = 8, .len = 1 },
+                    },
+                    .rhs = .{
+                        .data = .{ .neg = &.{
+                            .data = .{ .num = 4 },
+                            .location = .{ .index = 13, .len = 1 },
+                        } },
+                        .location = .{ .index = 12, .len = 2 },
+                    },
+                } },
+                .location = .{ .index = 8, .len = 6 },
+            },
         } },
-        .rhs = .{ .div = &.{
-            .lhs = .{ .num = 3 },
-            .rhs = .{ .neg = &.{ .num = 4 } },
-        } },
-    } });
+        .location = .{ .index = 0, .len = 14 },
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1199,19 +1467,47 @@ test "compile operators" {
         .add,
         .ret,
     }, program.instrs);
+
+    try std.testing.expectEqualSlices(Program.Location, &.{
+        .{ .offset = 2, .index = 0, .location = .{ .index = 0, .len = 1 } },
+        .{ .offset = 2, .index = 1, .location = .{ .index = 4, .len = 1 } },
+        .{ .offset = 5, .index = 0, .location = .{ .index = 13, .len = 1 } },
+        .{ .offset = 6, .index = 0, .location = .{ .index = 8, .len = 1 } },
+        .{ .offset = 6, .index = 1, .location = .{ .index = 12, .len = 2 } },
+        .{ .offset = 7, .index = 0, .location = .{ .index = 0, .len = 5 } },
+        .{ .offset = 7, .index = 1, .location = .{ .index = 8, .len = 6 } },
+    }, program.locations);
 }
 
 test "compile var" {
-    const program = try compile(std.testing.allocator, .{ .match = &.{
-        .subject = .{ .num = 4 },
-        .matchers = &.{.{
-            .pattern = .{ .name = "x" },
-            .expr = .{ .mul = &.{
-                .lhs = .{ .name = "x" },
-                .rhs = .{ .name = "x" },
-            } },
-        }},
-    } });
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .num = 4 },
+                .location = .{},
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "x" },
+                    .location = .{},
+                },
+                .expr = .{
+                    .data = .{ .mul = &.{
+                        .lhs = .{
+                            .data = .{ .name = "x" },
+                            .location = .{},
+                        },
+                        .rhs = .{
+                            .data = .{ .name = "x" },
+                            .location = .{},
+                        },
+                    } },
+                    .location = .{},
+                },
+            }},
+        } },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1224,26 +1520,62 @@ test "compile var" {
 }
 
 test "compile lambda" {
-    const program = try compile(std.testing.allocator, .{ .match = &.{
-        .subject = .{ .lambda = &.{
-            .pattern = .{ .list = &.{
-                .{ .name = "x" },
-            } },
-            .expr = .{ .mul = &.{
-                .lhs = .{ .name = "x" },
-                .rhs = .{ .name = "x" },
-            } },
-        } },
-        .matchers = &.{.{
-            .pattern = .{ .name = "sqr" },
-            .expr = .{ .call = &.{
-                .lhs = .{ .name = "sqr" },
-                .rhs = .{ .list = &.{
-                    .{ .num = 4 },
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .lambda = &.{
+                    .pattern = .{
+                        .data = .{ .list = &.{
+                            .{
+                                .data = .{ .name = "x" },
+                                .location = .{},
+                            },
+                        } },
+                        .location = .{},
+                    },
+                    .expr = .{
+                        .data = .{ .mul = &.{
+                            .lhs = .{
+                                .data = .{ .name = "x" },
+                                .location = .{},
+                            },
+                            .rhs = .{
+                                .data = .{ .name = "x" },
+                                .location = .{},
+                            },
+                        } },
+                        .location = .{},
+                    },
                 } },
-            } },
-        }},
-    } });
+                .location = .{},
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "sqr" },
+                    .location = .{},
+                },
+                .expr = .{
+                    .data = .{ .call = &.{
+                        .lhs = .{
+                            .data = .{ .name = "sqr" },
+                            .location = .{},
+                        },
+                        .rhs = .{
+                            .data = .{ .list = &.{
+                                .{
+                                    .data = .{ .num = 4 },
+                                    .location = .{},
+                                },
+                            } },
+                            .location = .{},
+                        },
+                    } },
+                    .location = .{},
+                },
+            }},
+        } },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1270,32 +1602,77 @@ test "compile lambda" {
 }
 
 test "compile closure" {
-    const program = try compile(std.testing.allocator, .{ .match = &.{
-        .subject = .{ .num = 2 },
-        .matchers = &.{.{
-            .pattern = .{ .name = "n" },
-            .expr = .{ .match = &.{
-                .subject = .{ .lambda = &.{
-                    .pattern = .{ .list = &.{
-                        .{ .name = "x" },
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .num = 2 },
+                .location = .{},
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .name = "n" },
+                    .location = .{},
+                },
+                .expr = .{
+                    .data = .{ .match = &.{
+                        .subject = .{
+                            .data = .{ .lambda = &.{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "x" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .expr = .{
+                                    .data = .{ .mul = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "x" },
+                                            .location = .{},
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                            } },
+                            .location = .{},
+                        },
+                        .matchers = &.{.{
+                            .pattern = .{
+                                .data = .{ .name = "times_n" },
+                                .location = .{},
+                            },
+                            .expr = .{
+                                .data = .{ .call = &.{
+                                    .lhs = .{
+                                        .data = .{ .name = "times_n" },
+                                        .location = .{},
+                                    },
+                                    .rhs = .{
+                                        .data = .{ .list = &.{
+                                            .{
+                                                .data = .{ .num = 4 },
+                                                .location = .{},
+                                            },
+                                        } },
+                                        .location = .{},
+                                    },
+                                } },
+                                .location = .{},
+                            },
+                        }},
                     } },
-                    .expr = .{ .mul = &.{
-                        .lhs = .{ .name = "x" },
-                        .rhs = .{ .name = "n" },
-                    } },
-                } },
-                .matchers = &.{.{
-                    .pattern = .{ .name = "times_n" },
-                    .expr = .{ .call = &.{
-                        .lhs = .{ .name = "times_n" },
-                        .rhs = .{ .list = &.{
-                            .{ .num = 4 },
-                        } },
-                    } },
-                }},
-            } },
-        }},
-    } });
+                    .location = .{},
+                },
+            }},
+        } },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1324,22 +1701,76 @@ test "compile closure" {
 }
 
 test "compile dict" {
-    const program = try compile(std.testing.allocator, .{ .match = &.{
-        .subject = .{ .dict = &.{
-            .{ .key = .{ .str = "foo" }, .value = .{ .num = 1 } },
-            .{ .key = .{ .str = "bar" }, .value = .{ .num = 2 } },
-            .{ .key = .{ .str = "baz" }, .value = .{ .num = 3 } },
-        } },
-        .matchers = &.{.{
-            .pattern = .{ .dicts = &.{
-                .{ .dict = &.{
-                    .{ .key = .{ .str = "foo" }, .value = .{ .name = "foo" } },
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .match = &.{
+            .subject = .{
+                .data = .{ .dict = &.{
+                    .{
+                        .key = .{
+                            .data = .{ .str = "foo" },
+                            .location = .{},
+                        },
+                        .value = .{
+                            .data = .{ .num = 1 },
+                            .location = .{},
+                        },
+                    },
+                    .{
+                        .key = .{
+                            .data = .{ .str = "bar" },
+                            .location = .{},
+                        },
+                        .value = .{
+                            .data = .{ .num = 2 },
+                            .location = .{},
+                        },
+                    },
+                    .{
+                        .key = .{
+                            .data = .{ .str = "baz" },
+                            .location = .{},
+                        },
+                        .value = .{
+                            .data = .{ .num = 3 },
+                            .location = .{},
+                        },
+                    },
                 } },
-                .ignore,
-            } },
-            .expr = .{ .name = "foo" },
-        }},
-    } });
+                .location = .{},
+            },
+            .matchers = &.{.{
+                .pattern = .{
+                    .data = .{ .dicts = &.{
+                        .{
+                            .data = .{ .dict = &.{
+                                .{
+                                    .key = .{
+                                        .data = .{ .str = "foo" },
+                                        .location = .{},
+                                    },
+                                    .value = .{
+                                        .data = .{ .name = "foo" },
+                                        .location = .{},
+                                    },
+                                },
+                            } },
+                            .location = .{},
+                        },
+                        .{
+                            .data = .ignore,
+                            .location = .{},
+                        },
+                    } },
+                    .location = .{},
+                },
+                .expr = .{
+                    .data = .{ .name = "foo" },
+                    .location = .{},
+                },
+            }},
+        } },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{
@@ -1369,74 +1800,185 @@ test "compile dict" {
 }
 
 test "compile module" {
-    const program = try compile(std.testing.allocator, .{ .module = &.{
-        .{
-            .fn_name = null,
-            .is_pub = false,
-            .pattern = .{ .name = "A" },
-            .subject = .{ .num = 0 },
-        },
-        .{
-            .fn_name = null,
-            .is_pub = false,
-            .pattern = .{ .name = "B" },
-            .subject = .{ .num = 1 },
-        },
-        .{
-            .fn_name = "fib",
-            .is_pub = true,
-            .pattern = .{ .lists = &.{
-                .{ .name = "args" },
-            } },
-            .subject = .{ .match = &.{
-                .subject = .{ .name = "args" },
-                .matchers = &.{
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .expr = &.{ .num = 0 } },
-                            .{ .name = "a" },
-                            .ignore,
-                        } },
-                        .expr = .{ .name = "a" },
-                    },
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .name = "n" },
-                            .{ .name = "a" },
-                            .{ .name = "b" },
-                        } },
-                        .expr = .{ .call = &.{
-                            .lhs = .{ .name = "fib" },
-                            .rhs = .{ .list = &.{
-                                .{ .sub = &.{
-                                    .lhs = .{ .name = "n" },
-                                    .rhs = .{ .num = 1 },
-                                } },
-                                .{ .name = "b" },
-                                .{ .add = &.{
-                                    .lhs = .{ .name = "a" },
-                                    .rhs = .{ .name = "b" },
-                                } },
-                            } },
-                        } },
-                    },
-                    .{
-                        .pattern = .{ .list = &.{
-                            .{ .name = "n" },
-                        } },
-                        .expr = .{ .call = &.{
-                            .lhs = .{ .name = "fib" },
-                            .rhs = .{ .list = &.{
-                                .{ .name = "n" },
-                                .{ .name = "A" },
-                                .{ .name = "B" },
-                            } },
-                        } },
-                    },
+    const program = try compile(std.testing.allocator, .{
+        .data = .{ .module = &.{
+            .{
+                .fn_name = null,
+                .is_pub = false,
+                .pattern = .{
+                    .data = .{ .name = "A" },
+                    .location = .{},
                 },
-            } },
-        },
-    } });
+                .subject = .{
+                    .data = .{ .num = 0 },
+                    .location = .{},
+                },
+            },
+            .{
+                .fn_name = null,
+                .is_pub = false,
+                .pattern = .{
+                    .data = .{ .name = "B" },
+                    .location = .{},
+                },
+                .subject = .{
+                    .data = .{ .num = 1 },
+                    .location = .{},
+                },
+            },
+            .{
+                .fn_name = "fib",
+                .is_pub = true,
+                .pattern = .{
+                    .data = .{ .lists = &.{
+                        .{
+                            .data = .{ .name = "args" },
+                            .location = .{},
+                        },
+                    } },
+                    .location = .{},
+                },
+                .subject = .{
+                    .data = .{ .match = &.{
+                        .subject = .{
+                            .data = .{ .name = "args" },
+                            .location = .{},
+                        },
+                        .matchers = &.{
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .expr = &.{
+                                                .data = .{ .num = 0 },
+                                                .location = .{},
+                                            } },
+                                            .location = .{},
+                                        },
+                                        .{
+                                            .data = .{ .name = "a" },
+                                            .location = .{},
+                                        },
+                                        .{
+                                            .data = .ignore,
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .expr = .{
+                                    .data = .{ .name = "a" },
+                                    .location = .{},
+                                },
+                            },
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{},
+                                        },
+                                        .{
+                                            .data = .{ .name = "a" },
+                                            .location = .{},
+                                        },
+                                        .{
+                                            .data = .{ .name = "b" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .expr = .{
+                                    .data = .{ .call = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "fib" },
+                                            .location = .{},
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .list = &.{
+                                                .{
+                                                    .data = .{ .sub = &.{
+                                                        .lhs = .{
+                                                            .data = .{ .name = "n" },
+                                                            .location = .{},
+                                                        },
+                                                        .rhs = .{
+                                                            .data = .{ .num = 1 },
+                                                            .location = .{},
+                                                        },
+                                                    } },
+                                                    .location = .{},
+                                                },
+                                                .{
+                                                    .data = .{ .name = "b" },
+                                                    .location = .{},
+                                                },
+                                                .{
+                                                    .data = .{ .add = &.{
+                                                        .lhs = .{
+                                                            .data = .{ .name = "a" },
+                                                            .location = .{},
+                                                        },
+                                                        .rhs = .{
+                                                            .data = .{ .name = "b" },
+                                                            .location = .{},
+                                                        },
+                                                    } },
+                                                    .location = .{},
+                                                },
+                                            } },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                            },
+                            .{
+                                .pattern = .{
+                                    .data = .{ .list = &.{
+                                        .{
+                                            .data = .{ .name = "n" },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                                .expr = .{
+                                    .data = .{ .call = &.{
+                                        .lhs = .{
+                                            .data = .{ .name = "fib" },
+                                            .location = .{},
+                                        },
+                                        .rhs = .{
+                                            .data = .{ .list = &.{
+                                                .{
+                                                    .data = .{ .name = "n" },
+                                                    .location = .{},
+                                                },
+                                                .{
+                                                    .data = .{ .name = "A" },
+                                                    .location = .{},
+                                                },
+                                                .{
+                                                    .data = .{ .name = "B" },
+                                                    .location = .{},
+                                                },
+                                            } },
+                                            .location = .{},
+                                        },
+                                    } },
+                                    .location = .{},
+                                },
+                            },
+                        },
+                    } },
+                    .location = .{},
+                },
+            },
+        } },
+        .location = .{},
+    });
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(Instr, &.{

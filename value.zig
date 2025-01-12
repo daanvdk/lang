@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Instr = @import("instr.zig").Instr;
+const BaseProgram = @import("program.zig").Program;
 const Runner = @import("runner.zig").Runner;
 
 pub const Value = union(enum) {
@@ -9,7 +10,7 @@ pub const Value = union(enum) {
     null,
     str: [8]u8,
     nil,
-    builtin: *const fn (*Runner, ?*Cons) Runner.Error!Value,
+    builtin: *const fn (*Runner, ?*Cons) anyerror!Value,
     obj: *Obj,
 
     pub fn eql(self: Value, other: Value) bool {
@@ -194,6 +195,7 @@ pub const Value = union(enum) {
         path: []const u8,
         instrs: []const Instr,
         data: []const u8,
+        locations: []const BaseProgram.Location,
 
         pub inline fn eql(_: *Program, _: *Program) bool {
             return false;
@@ -204,7 +206,7 @@ pub const Value = union(enum) {
         }
 
         pub fn allocated(self: *Program) usize {
-            return @sizeOf(Instr) * self.instrs.len + @sizeOf(u8) * self.data.len;
+            return @sizeOf(Instr) * self.instrs.len + @sizeOf(u8) * self.data.len + @sizeOf(BaseProgram.Location) * self.locations.len;
         }
 
         pub fn mark(_: *Program) void {}
@@ -212,6 +214,7 @@ pub const Value = union(enum) {
         pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
             allocator.free(self.instrs);
             allocator.free(self.data);
+            allocator.free(self.locations);
         }
 
         pub fn write(_: *Program, writer: anytype) !void {

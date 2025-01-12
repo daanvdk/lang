@@ -1,20 +1,26 @@
 const std = @import("std");
 
 const Expr = @import("expr.zig").Expr;
+const Instr = @import("instr.zig").Instr;
 
-pub const Pattern = union(enum) {
-    name: []const u8,
-    ignore,
-    expr: *const Expr,
-    guard: *const Guard,
+pub const Pattern = struct {
+    data: Data,
+    location: Instr.Location,
 
-    list: []const Pattern,
-    lists: []const Pattern,
-    dict: []const Pattern.Pair,
-    dicts: []const Pattern,
+    pub const Data = union(enum) {
+        name: []const u8,
+        ignore,
+        expr: *const Expr,
+        guard: *const Guard,
+
+        list: []const Pattern,
+        lists: []const Pattern,
+        dict: []const Pattern.Pair,
+        dicts: []const Pattern,
+    };
 
     pub fn deinit(self: Pattern, allocator: std.mem.Allocator) void {
-        switch (self) {
+        switch (self.data) {
             .name, .ignore => {},
             inline .list, .lists, .dict, .dicts => |items| {
                 for (items) |item| item.deinit(allocator);
@@ -28,9 +34,10 @@ pub const Pattern = union(enum) {
     }
 
     pub fn clone(self: Pattern, allocator: std.mem.Allocator) std.mem.Allocator.Error!Pattern {
-        switch (self) {
-            .name, .ignore => return self,
-            inline .list, .lists, .dict, .dicts => |items, tag| {
+        var copy = self;
+        copy.data = switch (self.data) {
+            .name, .ignore => self.data,
+            inline .list, .lists, .dict, .dicts => |items, tag| data: {
                 const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
                 errdefer {
@@ -40,19 +47,20 @@ pub const Pattern = union(enum) {
                 while (i < items.len) : (i += 1) {
                     copies[i] = try items[i].clone(allocator);
                 }
-                return @unionInit(Pattern, @tagName(tag), copies);
+                break :data @unionInit(Pattern.Data, @tagName(tag), copies);
             },
-            inline else => |value, tag| {
-                const copy = try allocator.create(@TypeOf(value.*));
-                errdefer allocator.destroy(copy);
-                copy.* = try value.clone(allocator);
-                return @unionInit(Pattern, @tagName(tag), copy);
+            inline else => |value, tag| data: {
+                const copy_ = try allocator.create(@TypeOf(value.*));
+                errdefer allocator.destroy(copy_);
+                copy_.* = try value.clone(allocator);
+                break :data @unionInit(Pattern.Data, @tagName(tag), copy_);
             },
-        }
+        };
+        return copy;
     }
 
     pub fn usesName(self: Pattern, name: []const u8) ?bool {
-        return switch (self) {
+        return switch (self.data) {
             .name => |name_| if (std.mem.eql(u8, name_, name)) false else null,
             .ignore => null,
             inline .list, .lists, .dict, .dicts => |items| for (items) |item| {

@@ -6,10 +6,12 @@ const Value = @import("value.zig").Value;
 pub const Program = struct {
     instrs: []const Instr,
     data: []const u8,
+    locations: []const Location,
 
     pub fn deinit(self: Program, allocator: std.mem.Allocator) void {
         allocator.free(self.instrs);
         allocator.free(self.data);
+        allocator.free(self.locations);
     }
 
     pub fn format(self: Program, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
@@ -56,4 +58,10 @@ pub const Program = struct {
             }
         }
     }
+
+    pub const Location = struct {
+        offset: usize,
+        index: usize,
+        location: Instr.Location,
+    };
 };

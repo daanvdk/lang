@@ -12,6 +12,7 @@ const Compiler = @import("compiler.zig").Compiler;
 const paths = @import("paths.zig");
 
 const suffix = ".lang";
+const main = .{ .str = Value.toShort("main").? };
 
 const stdlib = .{
     .send = (
@@ -166,29 +167,12 @@ pub const Runner = struct {
     next_gc: usize,
     allocated: usize = 0,
 
-    pub const Error = std.mem.Allocator.Error || Parser.Error || Compiler.Error || error{RunError};
+    pub const Error = error{RunError};
 
     pub fn init(allocator: std.mem.Allocator) Runner.Error!Runner {
-        var offsets: StdlibOffsets = undefined;
-        const base_program = program: {
-            var buffer = Buffer.init(allocator);
-            defer buffer.deinit();
-
-            var compiler = Compiler.init(&buffer);
-            defer compiler.deinit();
-
-            inline for (@typeInfo(Stdlib).Struct.fields) |field| {
-                @field(offsets, field.name) = compiler.instrs.items.len;
-                const content = @field(stdlib, field.name);
-                const expr = try internal_parse(allocator, content);
-                defer expr.deinit(allocator);
-                _ = try compiler.compileExpr(expr, .returned);
-            }
-
-            const data = try buffer.content.toOwnedSlice();
-            errdefer allocator.free(data);
-            const instrs = try compiler.instrs.toOwnedSlice();
-            break :program Program{ .instrs = instrs, .data = data };
+        const stdlib_ = compileStdlib(allocator) catch |err| {
+            std.debug.print("{s}\n", .{@errorName(err)});
+            return error.RunError;
         };
 
         var self = Runner{
@@ -198,19 +182,12 @@ pub const Runner = struct {
         };
         errdefer self.deinit();
 
-        const program = program: {
-            errdefer base_program.deinit(allocator);
-            break :program try self.create(.program, .{
-                .path = "<stdlib>",
-                .instrs = base_program.instrs,
-                .data = base_program.data,
-            });
-        };
+        const program = try self.createProgram("<stdlib>", stdlib_.program);
 
         inline for (@typeInfo(Stdlib).Struct.fields) |field| {
             var call = Call{
                 .program = program,
-                .offset = @field(offsets, field.name),
+                .offset = @field(stdlib_.offsets, field.name),
             };
             defer call.stack.deinit(allocator);
             @field(self.stdlib_values, field.name) = try self.run(&call);
@@ -220,6 +197,39 @@ pub const Runner = struct {
         self.checkGc();
 
         return self;
+    }
+
+    fn compileStdlib(allocator: std.mem.Allocator) !struct { offsets: StdlibOffsets, program: Program } {
+        var buffer = Buffer.init(allocator);
+        defer buffer.deinit();
+
+        var compiler = Compiler.init(&buffer);
+        defer compiler.deinit();
+
+        var offsets: StdlibOffsets = undefined;
+        inline for (@typeInfo(Stdlib).Struct.fields) |field| {
+            @field(offsets, field.name) = compiler.instrs.items.len;
+            const content = @field(stdlib, field.name);
+            const expr = internal_parse(allocator, content) catch |err| {
+                std.debug.print("{s}\n", .{@errorName(err)});
+                return error.RunError;
+            };
+            defer expr.deinit(allocator);
+            _ = compiler.compileExpr(expr, .returned) catch |err| {
+                std.debug.print("{s}\n", .{@errorName(err)});
+                return error.RunError;
+            };
+        }
+
+        const data = try buffer.content.toOwnedSlice();
+        errdefer allocator.free(data);
+        const instrs = try compiler.instrs.toOwnedSlice();
+        errdefer allocator.free(instrs);
+        const locations = try compiler.locations.toOwnedSlice();
+        return .{
+            .offsets = offsets,
+            .program = .{ .instrs = instrs, .data = data, .locations = locations },
+        };
     }
 
     pub fn deinit(self: *Runner) void {
@@ -241,8 +251,8 @@ pub const Runner = struct {
         }
     }
 
-    pub fn create(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !*obj_type.Detail() {
-        const detail = try self.allocator.create(obj_type.Detail());
+    pub fn create(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) Error!*obj_type.Detail() {
+        const detail = try self.wrapError(self.allocator.create(obj_type.Detail()));
         detail.* = data;
         detail.obj = .{
             .type = obj_type,
@@ -299,21 +309,22 @@ pub const Runner = struct {
         }
     }
 
-    pub fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) !Value {
+    pub fn createValue(self: *Runner, comptime obj_type: Value.ObjType, data: obj_type.Detail()) Error!Value {
         const detail = try self.create(obj_type, data);
         return detail.obj.toValue();
     }
 
-    pub fn createProgram(self: *Runner, path: []const u8, program: Program) !*Value.Program {
+    pub fn createProgram(self: *Runner, path: []const u8, program: Program) Error!*Value.Program {
         errdefer program.deinit(self.allocator);
         return try self.create(.program, .{
             .path = path,
             .instrs = program.instrs,
             .data = program.data,
+            .locations = program.locations,
         });
     }
 
-    pub fn createList(self: *Runner, items: []const Value) !?*Value.Cons {
+    pub fn createList(self: *Runner, items: []const Value) Error!?*Value.Cons {
         var tail: ?*Value.Cons = null;
         var i = items.len;
         while (i > 0) {
@@ -323,7 +334,7 @@ pub const Runner = struct {
         return tail;
     }
 
-    pub fn createListValue(self: *Runner, items: []const Value) !Value {
+    pub fn createListValue(self: *Runner, items: []const Value) Error!Value {
         return Value.Cons.toValue(try self.createList(items));
     }
 
@@ -339,20 +350,17 @@ pub const Runner = struct {
         errdefer self.modules.removeByPtr(result.key_ptr);
 
         const program = program: {
-            const file = std.fs.cwd().openFile(path, .{}) catch |err| return switch (err) {
-                error.FileNotFound => error.FileNotFound,
-                else => error.RunError,
-            };
+            const file = try std.fs.cwd().openFile(path, .{});
             defer file.close();
 
-            const content = std.posix.mmap(
+            const content = try std.posix.mmap(
                 null,
-                (file.metadata() catch return error.RunError).size(),
+                (try file.metadata()).size(),
                 std.posix.PROT.READ,
                 .{ .TYPE = .SHARED },
                 file.handle,
                 0,
-            ) catch return error.RunError;
+            );
             defer std.posix.munmap(content);
 
             const expr = try parse(self.allocator, content);
@@ -365,6 +373,11 @@ pub const Runner = struct {
         return value;
     }
 
+    pub fn runPathAndMain(self: *Runner, path: []const u8) !void {
+        const module = try self.expectDict(null, try self.runPath(path));
+        if (module.get(main)) |main_| _ = try self.runLambda(main_, &.{});
+    }
+
     pub fn runProgram(self: *Runner, path: []const u8, program: Program) Error!Value {
         const program_ = try self.createProgram(path, program);
         var call = Call{ .program = program_, .offset = 0 };
@@ -373,6 +386,10 @@ pub const Runner = struct {
     }
 
     pub fn run(self: *Runner, call: *Call) Error!Value {
+        return try self.wrapError(self.innerRun(call));
+    }
+
+    fn innerRun(self: *Runner, call: *Call) !Value {
         try self.calls.append(self.allocator, call);
         defer _ = self.calls.pop();
 
@@ -416,13 +433,13 @@ pub const Runner = struct {
                 },
 
                 .cons => {
-                    const tail = try expectList(call.stack.pop());
+                    const tail = try self.expectList(.{ ip, 1 }, call.stack.pop());
                     const head = call.stack.pop();
                     const cons = try self.createValue(.cons, .{ .head = head, .tail = tail });
                     try call.stack.append(self.allocator, cons);
                 },
                 .decons => {
-                    const cons = try expectCons(call.stack.pop());
+                    const cons = try self.expectCons(null, call.stack.pop());
                     try call.stack.append(self.allocator, cons.head);
                     try call.stack.append(self.allocator, Value.Cons.toValue(cons.tail));
                 },
@@ -433,13 +450,13 @@ pub const Runner = struct {
                 .put_dict => {
                     const value = call.stack.pop();
                     const key = call.stack.pop();
-                    var dict = try expectDict(call.stack.pop());
+                    var dict = try self.expectDict(null, call.stack.pop());
                     dict = try dict.put(self, key, value);
                     try call.stack.append(self.allocator, dict.obj.toValue());
                 },
                 .pop_dict => {
                     const key = call.stack.pop();
-                    const dict = try expectDict(call.stack.pop());
+                    const dict = try self.expectDict(null, call.stack.pop());
                     const result = try dict.pop(self, key);
                     try call.stack.append(self.allocator, result.value);
                     try call.stack.append(self.allocator, result.dict.obj.toValue());
@@ -463,8 +480,8 @@ pub const Runner = struct {
                 },
 
                 .call => {
-                    const args = try expectList(call.stack.pop());
-                    const value = switch (try expectCallable(call.stack.pop())) {
+                    const args = try self.expectList(.{ ip, 1 }, call.stack.pop());
+                    const value = switch (try self.expectCallable(.{ ip, 0 }, call.stack.pop())) {
                         .builtin => |builtin| try builtin(self, args),
                         .lambda => |lambda| value: {
                             var call_ = Call{
@@ -477,14 +494,17 @@ pub const Runner = struct {
                             call_.stack.appendSliceAssumeCapacity(lambda.stack);
                             call_.stack.appendAssumeCapacity(Value.Cons.toValue(args));
 
+                            const location = self.getLocation(ip, 1);
+                            call.location = location;
+                            defer call.location = .{};
                             break :value try self.run(&call_);
                         },
                     };
                     try call.stack.append(self.allocator, value);
                 },
                 .tail_call => {
-                    const args = try expectList(call.stack.pop());
-                    switch (try expectCallable(call.stack.pop())) {
+                    const args = try self.expectList(.{ ip, 1 }, call.stack.pop());
+                    switch (try self.expectCallable(.{ ip, 0 }, call.stack.pop())) {
                         .builtin => |builtin| {
                             call.stack.clearAndFree(self.allocator);
                             return try builtin(self, args);
@@ -498,6 +518,8 @@ pub const Runner = struct {
                             call.stack.appendSliceAssumeCapacity(lambda.stack);
                             call.stack.appendAssumeCapacity(Value.Cons.toValue(args));
 
+                            call.is_tail_call = true;
+
                             ip = call.program.instrs.ptr + call.offset;
                         },
                     }
@@ -505,54 +527,62 @@ pub const Runner = struct {
                 .get => {
                     const rhs = call.stack.pop();
                     const lhs = call.stack.pop();
-                    try call.stack.append(self.allocator, switch (lhs) {
+                    try call.stack.append(self.allocator, if (lhs.toStr()) |content| char: {
+                        const index = try self.expectIndex(.{ ip, 1 }, rhs);
+                        var offset: usize = 0;
+                        for (0..index) |_| {
+                            offset += initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
+                        }
+                        const len = initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
+                        break :char try self.strSlice(lhs, content[offset .. offset + len]);
+                    } else switch (lhs) {
                         .obj => |obj| switch (obj.type) {
                             .cons => get: {
-                                var index: usize = @intFromFloat(try expectNum(rhs));
+                                const index = try self.expectIndex(.{ ip, 1 }, rhs);
                                 var cons = Value.ObjType.cons.detailed(obj);
-                                while (index > 0) : (index -= 1) {
-                                    cons = cons.tail orelse return error.RunError;
+                                for (0..index) |_| {
+                                    cons = cons.tail orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
                                 }
                                 break :get cons.head;
                             },
-                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return error.RunError,
-                            else => return error.RunError,
+                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return self.runError(.{ ip, 1 }, "Key error: {}\n", .{rhs}),
+                            else => return self.runError(.{ ip, 0 }, "Expected an indexable value\n", .{}),
                         },
-                        else => return error.RunError,
+                        else => return self.runError(.{ ip, 0 }, "Expected an indexable value\n", .{}),
                     });
                 },
 
                 .pow => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = std.math.pow(f64, lhs, rhs) });
                 },
                 .pos => {
-                    const value = try expectNum(call.stack.pop());
+                    const value = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = value });
                 },
                 .neg => {
-                    const value = try expectNum(call.stack.pop());
+                    const value = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = -value });
                 },
                 .mul => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = lhs * rhs });
                 },
                 .div => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = lhs / rhs });
                 },
                 .add => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = lhs + rhs });
                 },
                 .sub => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .num = lhs - rhs });
                 },
 
@@ -567,29 +597,32 @@ pub const Runner = struct {
                     try call.stack.append(self.allocator, .{ .bool = !lhs.eql(rhs) });
                 },
                 .lt => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .bool = lhs < rhs });
                 },
                 .le => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .bool = lhs <= rhs });
                 },
                 .gt => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .bool = lhs > rhs });
                 },
                 .ge => {
-                    const rhs = try expectNum(call.stack.pop());
-                    const lhs = try expectNum(call.stack.pop());
+                    const rhs = try self.expectNum(.{ ip, 1 }, call.stack.pop());
+                    const lhs = try self.expectNum(.{ ip, 0 }, call.stack.pop());
                     try call.stack.append(self.allocator, .{ .bool = lhs >= rhs });
                 },
                 .in => {
                     const rhs = call.stack.pop();
                     const lhs = call.stack.pop();
-                    try call.stack.append(self.allocator, .{ .bool = switch (rhs) {
+                    try call.stack.append(self.allocator, .{ .bool = if (rhs.toStr()) |haystack| in: {
+                        const needle = try self.expectStr(.{ ip, 0 }, &lhs);
+                        break :in std.mem.indexOf(u8, haystack, needle) != null;
+                    } else switch (rhs) {
                         .nil => false,
                         .obj => |obj| switch (obj.type) {
                             .cons => in: {
@@ -600,9 +633,9 @@ pub const Runner = struct {
                                 }
                             },
                             .dict => Value.ObjType.dict.detailed(obj).get(lhs) != null,
-                            else => return error.RunError,
+                            else => return self.runError(.{ ip, 1 }, "Expected a searchable value\n", .{}),
                         },
-                        else => return error.RunError,
+                        else => return self.runError(.{ ip, 1 }, "Expected a searchable value\n", .{}),
                     } });
                 },
 
@@ -636,79 +669,181 @@ pub const Runner = struct {
                     };
                     return try self.createListValue(&.{ head, tail });
                 },
-                .no_match => {
-                    return error.RunError;
-                },
+                .no_match => return self.runError(.{ ip, 0 }, "No match\n", .{}),
             }
         }
         self.checkGc();
     }
 
-    pub fn expectNum(value: Value) !f64 {
-        return switch (value) {
-            .num => |num| num,
-            else => error.RunError,
+    fn getLocation(self: *Runner, ip: [*]const Instr, index: usize) Instr.Location {
+        const program = self.calls.items[self.calls.items.len - 1].program;
+        const offset = (@intFromPtr(ip - 1) - @intFromPtr(program.instrs.ptr)) / @sizeOf(Instr);
+
+        var min_index: usize = 0;
+        var max_index = program.locations.len;
+        while (min_index < max_index) {
+            const mid_index = (min_index + max_index) / 2;
+            const location = program.locations[mid_index];
+
+            if (location.offset < offset or (location.offset == offset and location.index < index)) {
+                min_index = mid_index + 1;
+            } else if (location.offset == offset and location.index == index) {
+                return location.location;
+            } else {
+                max_index = mid_index;
+            }
+        }
+
+        return .{};
+    }
+
+    const LocationSpec = std.meta.Tuple(&.{ [*]const Instr, usize });
+
+    fn runError(self: *Runner, spec: ?LocationSpec, comptime fmt: []const u8, args: anytype) error{RunError} {
+        const location = if (spec) |spec_| @call(.auto, Runner.getLocation, .{self} ++ spec_) else Instr.Location{};
+        const call = self.calls.items[self.calls.items.len - 1];
+        call.location = location;
+        self.printStackTrace();
+        std.debug.print(fmt, args);
+        call.location = .{};
+        return error.RunError;
+    }
+
+    pub fn wrapError(self: *Runner, result: anytype) Error!@typeInfo(@TypeOf(result)).ErrorUnion.payload {
+        return result catch |err| return switch (@as(anyerror, err)) {
+            error.RunError => error.RunError,
+            else => self.runError(null, "{s}\n", .{@errorName(err)}),
         };
     }
 
-    pub fn expectStr(value: *const Value) ![]const u8 {
-        return value.toStr() orelse error.RunError;
+    pub fn expectNum(self: *Runner, spec: ?LocationSpec, value: Value) Error!f64 {
+        return switch (value) {
+            .num => |num| num,
+            else => self.runError(spec, "Expected a number\n", .{}),
+        };
     }
 
-    pub fn expectCons(value: Value) !*Value.Cons {
+    pub fn expectIndex(self: *Runner, spec: ?LocationSpec, value: Value) Error!usize {
+        const num = try self.expectNum(spec, value);
+        if (num < 0 or num != std.math.round(num)) {
+            return self.runError(spec, "Expected a positive integer\n", .{});
+        }
+        return @intFromFloat(num);
+    }
+
+    pub fn expectStr(self: *Runner, spec: ?LocationSpec, value: *const Value) Error![]const u8 {
+        return value.toStr() orelse self.runError(spec, "Expected a string\n", .{});
+    }
+
+    pub fn expectCons(self: *Runner, spec: ?LocationSpec, value: Value) Error!*Value.Cons {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
-                else => error.RunError,
+                else => self.runError(spec, "Expected a non empty list\n", .{}),
             },
-            else => error.RunError,
+            else => self.runError(spec, "Expected a non empty list\n", .{}),
         };
     }
 
-    pub fn expectDict(value: Value) !*Value.Dict {
+    pub fn expectDict(self: *Runner, spec: ?LocationSpec, value: Value) Error!*Value.Dict {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .dict => @fieldParentPtr("obj", obj),
-                else => error.RunError,
+                else => self.runError(spec, "Expected a dictionary\n", .{}),
             },
-            else => error.RunError,
+            else => self.runError(spec, "Expected a dictionary\n", .{}),
         };
     }
 
-    pub fn expectLambda(value: Value) !*Value.Lambda {
+    pub fn expectLambda(self: *Runner, spec: ?LocationSpec, value: Value) Error!*Value.Lambda {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .lambda => @fieldParentPtr("obj", obj),
-                else => error.RunError,
+                else => self.runError(spec, "Expected a function\n", .{}),
             },
-            else => error.RunError,
+            else => self.runError(spec, "Expected a function\n", .{}),
         };
     }
 
-    pub fn expectList(value: Value) !?*Value.Cons {
+    pub fn expectList(self: *Runner, spec: ?LocationSpec, value: Value) Error!?*Value.Cons {
         return switch (value) {
             .nil => null,
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
-                else => error.RunError,
+                else => self.runError(spec, "Expected a list\n", .{}),
             },
-            else => error.RunError,
+            else => self.runError(spec, "Expected a list\n", .{}),
         };
     }
 
-    pub fn expectCallable(value: Value) !Callable {
+    pub fn expectCallable(self: *Runner, spec: ?LocationSpec, value: Value) Error!Callable {
         return switch (value) {
             .builtin => |builtin| .{ .builtin = builtin },
             .obj => |obj| switch (obj.type) {
                 .lambda => .{ .lambda = @fieldParentPtr("obj", obj) },
-                else => error.RunError,
+                else => self.runError(spec, "Expected a lambda function\n", .{}),
             },
-            else => error.RunError,
+            else => self.runError(spec, "Expected a lambda function\n", .{}),
         };
     }
 
+    pub fn printStackTrace(self: *Runner) void {
+        std.debug.print("Stacktrace:\n", .{});
+        for (self.calls.items) |call| {
+            if (call.is_tail_call) {
+                std.debug.print("  ...some calls were optimized out by tail call optimization...\n", .{});
+            }
+            if (call.location.index == 0 and call.location.len == 0) continue;
+
+            const file = std.fs.cwd().openFile(call.program.path, .{}) catch continue;
+            defer file.close();
+
+            const content = std.posix.mmap(
+                null,
+                (file.metadata() catch continue).size(),
+                std.posix.PROT.READ,
+                .{ .TYPE = .SHARED },
+                file.handle,
+                0,
+            ) catch continue;
+            defer std.posix.munmap(content);
+
+            var line: usize = 1;
+            var line_start: usize = 0;
+            for (0.., content[0..call.location.index]) |index, char| {
+                if (char == '\n') {
+                    line += 1;
+                    line_start = index + 1;
+                }
+            }
+
+            std.debug.print("  File {s} at line {}:\n", .{ call.program.path, line });
+            const start: usize = call.location.index;
+            const end: usize = start + call.location.len;
+
+            while (line_start < end) {
+                var line_end: usize = undefined;
+                if (std.mem.indexOf(u8, content[line_start..], "\n")) |line_len| {
+                    line_end = line_start + line_len;
+                } else {
+                    line_end = content.len;
+                }
+                std.debug.print("    {s}\n", .{content[line_start..line_end]});
+
+                std.debug.print("    ", .{});
+                for (line_start..@min(line_end, end)) |index| {
+                    std.debug.print("{c}", .{@as(u8, if (index < start) ' ' else '^')});
+                }
+                std.debug.print("\n", .{});
+
+                line += 1;
+                line_start = line_end + 1;
+            }
+        }
+    }
+
     const Callable = union(enum) {
-        builtin: *const fn (*Runner, ?*Value.Cons) Error!Value,
+        builtin: *const fn (*Runner, ?*Value.Cons) anyerror!Value,
         lambda: *Value.Lambda,
     };
 
@@ -716,25 +851,27 @@ pub const Runner = struct {
         program: *Value.Program,
         offset: usize,
         stack: std.ArrayListUnmanaged(Value) = .{},
+        location: Instr.Location = .{},
+        is_tail_call: bool = false,
     };
 
     const Builtins = struct {
-        fn is_num(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_num(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = arg == .num };
         }
 
-        fn is_bool(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_bool(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = arg == .bool };
         }
 
-        fn is_null(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_null(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = arg == .null };
         }
 
-        fn is_str(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_str(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = switch (arg) {
                 .str => true,
@@ -743,7 +880,7 @@ pub const Runner = struct {
             } };
         }
 
-        fn is_list(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_list(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = switch (arg) {
                 .nil => true,
@@ -752,7 +889,7 @@ pub const Runner = struct {
             } };
         }
 
-        fn is_dict(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_dict(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = switch (arg) {
                 .obj => |obj| obj.type == .dict,
@@ -760,7 +897,7 @@ pub const Runner = struct {
             } };
         }
 
-        fn is_func(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn is_func(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
             return .{ .bool = switch (arg) {
                 .builtin => true,
@@ -769,7 +906,7 @@ pub const Runner = struct {
             } };
         }
 
-        fn str(self: *Runner, args: ?*Value.Cons) Error!Value {
+        fn str(self: *Runner, args: ?*Value.Cons) anyerror!Value {
             var iter = Value.Cons.iter(args);
             var buffer: std.ArrayListUnmanaged(u8) = .{};
             defer buffer.deinit(self.allocator);
@@ -791,7 +928,7 @@ pub const Runner = struct {
             }
         }
 
-        fn join(self: *Runner, args: ?*Value.Cons) Error!Value {
+        fn join(self: *Runner, args: ?*Value.Cons) anyerror!Value {
             var arg_iter = Value.Cons.iter(args);
             var iter = try arg_iter.expectNext();
             const joiner = arg_iter.next() orelse Value{ .str = Value.toShort("").? };
@@ -833,7 +970,7 @@ pub const Runner = struct {
             }
         }
 
-        fn print(_: *Runner, args: ?*Value.Cons) Error!Value {
+        fn print(_: *Runner, args: ?*Value.Cons) anyerror!Value {
             var iter = Value.Cons.iter(args);
             var first = true;
 
@@ -854,9 +991,9 @@ pub const Runner = struct {
             return .null;
         }
 
-        fn @"@str_send"(self: *Runner, args: ?*Value.Cons) Error!Value {
+        fn @"@str_send"(self: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
-            const content = try expectStr(&arg);
+            const content = try self.expectStr(null, &arg);
 
             var head: Value = undefined;
             var tail: Value = undefined;
@@ -871,9 +1008,9 @@ pub const Runner = struct {
             return try self.createListValue(&.{ head, tail });
         }
 
-        fn @"@dict_send"(self: *Runner, args: ?*Value.Cons) Error!Value {
+        fn @"@dict_send"(self: *Runner, args: ?*Value.Cons) anyerror!Value {
             var arg_iter = Value.Cons.iter(args);
-            const dict = try expectDict(try arg_iter.expectNext());
+            const dict = try self.expectDict(null, try arg_iter.expectNext());
             const key = arg_iter.next();
             try arg_iter.expectEnd();
 
@@ -892,23 +1029,20 @@ pub const Runner = struct {
             return try self.createListValue(&.{ head, tail });
         }
 
-        fn import(self: *Runner, args: ?*Value.Cons) Error!Value {
+        fn import(self: *Runner, args: ?*Value.Cons) anyerror!Value {
             const arg = try Value.Cons.expectOne(args);
-            const import_path = try expectStr(&arg);
+            const import_path = try self.expectStr(null, &arg);
             const curr_path = self.calls.items[self.calls.items.len - 1].program.path;
 
             var import_paths = paths.ImportIter.init(self.allocator, curr_path, import_path);
-            while (import_paths.next() catch |err| return switch (err) {
-                error.PopRoot => error.RunError,
-                inline else => |err_| err_,
-            }) |path| {
+            while (try import_paths.next()) |path| {
                 return self.runPath(path) catch |err| switch (err) {
                     error.FileNotFound => continue,
-                    else => return error.RunError,
+                    inline else => |err_| return err_,
                 };
             }
 
-            return error.RunError;
+            return self.runError(null, "Module not found: {s}\n", .{import_path});
         }
     };
 
@@ -932,18 +1066,18 @@ pub const Runner = struct {
     fn next(self: *Runner, iter: Value) Error!?[2]Value {
         const result = try self.runLambda(self.stdlib_values.next, &.{iter});
         if (result == .null) return null;
-        return try Value.Cons.expectN(try expectList(result), 2);
+        return try Value.Cons.expectN(try self.expectList(null, result), 2);
     }
 
     pub fn runLambda(self: *Runner, value: Value, args: []const Value) Error!Value {
-        const lambda = try expectLambda(value);
+        const lambda = try self.expectLambda(null, value);
         var call = Call{
             .program = lambda.program,
             .offset = lambda.offset,
         };
         defer call.stack.deinit(self.allocator);
 
-        try call.stack.ensureUnusedCapacity(self.allocator, lambda.stack.len + 1);
+        try self.wrapError(call.stack.ensureUnusedCapacity(self.allocator, lambda.stack.len + 1));
         call.stack.appendSliceAssumeCapacity(lambda.stack);
         call.stack.appendAssumeCapacity(try self.createListValue(args));
 
@@ -955,6 +1089,7 @@ fn cloneProgram(program: Program) !Program {
     return .{
         .instrs = try std.testing.allocator.dupe(Instr, program.instrs),
         .data = try std.testing.allocator.dupe(u8, program.data),
+        .locations = try std.testing.allocator.dupe(Program.Location, program.locations),
     };
 }
 
@@ -968,8 +1103,9 @@ test "run num 1" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 1337 }, value);
 }
@@ -984,8 +1120,9 @@ test "run num 2" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 45.67 }, value);
 }
@@ -1000,8 +1137,9 @@ test "run bool 1" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .bool = true }, value);
 }
@@ -1016,8 +1154,9 @@ test "run bool 2" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .bool = false }, value);
 }
@@ -1032,8 +1171,9 @@ test "run null" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value.null, value);
 }
@@ -1055,8 +1195,9 @@ test "run operators" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 1.25 }, value);
 }
@@ -1074,8 +1215,9 @@ test "run var" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 16 }, value);
 }
@@ -1107,8 +1249,9 @@ test "run lambda" {
             .tail_call,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 16 }, value);
 }
@@ -1120,6 +1263,7 @@ test "run closure" {
     const program = try cloneProgram(.{
         .instrs = &.{
             .{ .num = 2 },
+
             .{ .local = 0 },
             .{ .lambda = .{ .caps = 1, .len = 13 } },
             .{ .local = 1 },
@@ -1142,11 +1286,13 @@ test "run closure" {
             .tail_call,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 8 }, value);
 }
+
 test "compile dict" {
     var runner = try Runner.init(std.testing.allocator);
     defer runner.deinit();
@@ -1154,6 +1300,7 @@ test "compile dict" {
     const program = try cloneProgram(.{
         .instrs = &.{
             .empty_dict,
+
             .{ .short_str = Value.toShort("foo").? },
             .{ .num = 1 },
             .put_dict,
@@ -1177,8 +1324,9 @@ test "compile dict" {
             .ret,
         },
         .data = "",
+        .locations = &.{},
     });
-    const value = try runner.runProgram(program);
+    const value = try runner.runProgram("", program);
 
     try std.testing.expectEqualDeep(Value{ .num = 1 }, value);
 }

@@ -3,56 +3,61 @@ const std = @import("std");
 const Pattern = @import("pattern.zig").Pattern;
 const Instr = @import("instr.zig").Instr;
 
-pub const Expr = union(enum) {
-    global: Instr.Global,
-    name: []const u8,
-    num: f64,
-    bool: bool,
-    null,
-    str: []const u8,
+pub const Expr = struct {
+    data: Data,
+    location: Instr.Location,
 
-    list: []const Expr,
-    lists: []const Expr,
-    dict: []const Expr.Pair,
-    dicts: []const Expr,
-    lambda: *const Matcher,
+    pub const Data = union(enum) {
+        global: Instr.Global,
+        name: []const u8,
+        num: f64,
+        bool: bool,
+        null,
+        str: []const u8,
 
-    call: *const Bin,
-    get: *const Bin,
+        list: []const Expr,
+        lists: []const Expr,
+        dict: []const Pair,
+        dicts: []const Expr,
+        lambda: *const Matcher,
 
-    pow: *const Bin,
-    pos: *const Expr,
-    neg: *const Expr,
-    mul: *const Bin,
-    div: *const Bin,
-    add: *const Bin,
-    sub: *const Bin,
+        call: *const Bin,
+        get: *const Bin,
 
-    eq: *const Bin,
-    ne: *const Bin,
-    lt: *const Bin,
-    le: *const Bin,
-    gt: *const Bin,
-    ge: *const Bin,
-    in: *const Bin,
+        pow: *const Bin,
+        pos: *const Expr,
+        neg: *const Expr,
+        mul: *const Bin,
+        div: *const Bin,
+        add: *const Bin,
+        sub: *const Bin,
 
-    not: *const Expr,
-    @"and": *const Bin,
-    @"or": *const Bin,
+        eq: *const Bin,
+        ne: *const Bin,
+        lt: *const Bin,
+        le: *const Bin,
+        gt: *const Bin,
+        ge: *const Bin,
+        in: *const Bin,
 
-    match: *const Match,
-    @"if": *const If,
-    @"for": *const For,
-    gen: *const Expr,
-    yield: *const Expr,
-    yield_all: *const Expr,
-    @"return": *const Expr,
-    assert: *const Expr,
+        not: *const Expr,
+        @"and": *const Bin,
+        @"or": *const Bin,
 
-    module: []const Stmt,
+        match: *const Match,
+        @"if": *const If,
+        @"for": *const For,
+        gen: *const Expr,
+        yield: *const Expr,
+        yield_all: *const Expr,
+        @"return": *const Expr,
+        assert: *const Expr,
+
+        module: []const Stmt,
+    };
 
     pub fn deinit(self: Expr, allocator: std.mem.Allocator) void {
-        switch (self) {
+        switch (self.data) {
             .global, .name, .num, .bool, .null => {},
             .str => |content| allocator.free(content),
             inline .list, .lists, .dict, .dicts, .module => |items| {
@@ -67,10 +72,11 @@ pub const Expr = union(enum) {
     }
 
     pub fn clone(self: Expr, allocator: std.mem.Allocator) std.mem.Allocator.Error!Expr {
-        switch (self) {
-            .global, .name, .num, .bool, .null => return self,
-            .str => |content| return .{ .str = try allocator.dupe(u8, content) },
-            inline .list, .lists, .dict, .dicts, .module => |items, tag| {
+        var copy = self;
+        copy.data = switch (self.data) {
+            .global, .name, .num, .bool, .null => self.data,
+            .str => |content| .{ .str = try allocator.dupe(u8, content) },
+            inline .list, .lists, .dict, .dicts, .module => |items, tag| data: {
                 const copies = try allocator.alloc(@TypeOf(items[0]), items.len);
                 var i: usize = 0;
                 errdefer {
@@ -80,19 +86,20 @@ pub const Expr = union(enum) {
                 while (i < items.len) : (i += 1) {
                     copies[i] = try items[i].clone(allocator);
                 }
-                return @unionInit(Expr, @tagName(tag), copies);
+                break :data @unionInit(Data, @tagName(tag), copies);
             },
-            inline else => |value, tag| {
-                const copy = try allocator.create(@TypeOf(value.*));
-                errdefer allocator.destroy(copy);
-                copy.* = try value.clone(allocator);
-                return @unionInit(Expr, @tagName(tag), copy);
+            inline else => |value, tag| data: {
+                const copy_ = try allocator.create(@TypeOf(value.*));
+                errdefer allocator.destroy(copy_);
+                copy_.* = try value.clone(allocator);
+                break :data @unionInit(Data, @tagName(tag), copy_);
             },
-        }
+        };
+        return copy;
     }
 
     pub fn usesName(self: Expr, name: []const u8) bool {
-        return switch (self) {
+        return switch (self.data) {
             .global, .num, .bool, .null, .str => false,
             .name => |name_| std.mem.eql(u8, name_, name),
             inline .list, .lists, .dict, .dicts => |items| for (items) |item| {
@@ -138,7 +145,7 @@ pub const Expr = union(enum) {
         }
 
         pub fn clone(self: Bin, allocator: std.mem.Allocator) std.mem.Allocator.Error!Bin {
-            var copy: Bin = undefined;
+            var copy: Bin = self;
             copy.lhs = try self.lhs.clone(allocator);
             errdefer copy.lhs.deinit(allocator);
             copy.rhs = try self.rhs.clone(allocator);
@@ -181,7 +188,7 @@ pub const Expr = union(enum) {
             if (self.subject.usesName(name)) return true;
             for (self.matchers) |matcher| {
                 if (matcher.usesName(name)) return true;
-                if (matcher.pattern == .ignore) break;
+                if (matcher.pattern.data == .ignore) break;
             }
             return false;
         }
@@ -197,7 +204,7 @@ pub const Expr = union(enum) {
         }
 
         pub fn clone(self: Matcher, allocator: std.mem.Allocator) std.mem.Allocator.Error!Matcher {
-            var copy: Matcher = undefined;
+            var copy: Matcher = self;
             copy.pattern = try self.pattern.clone(allocator);
             errdefer copy.pattern.deinit(allocator);
             copy.expr = try self.expr.clone(allocator);
