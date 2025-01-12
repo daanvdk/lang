@@ -15,12 +15,16 @@ const main = .{ .str = Value.toShort("main").? };
 
 const stdlib = .{
     .send = (
-        \\|iter, value| do
+        \\|iter, *args| do
+        \\  value = match args do
+        \\    [value] = value
+        \\    []      = null
+        \\  end
         \\  if [*list] = iter do
         \\    if [head, *tail] = list do
-        \\      [head, tail]
+        \\      ["ok", head, tail]
         \\    else
-        \\      [null, null]
+        \\      ["stop", null]
         \\    end
         \\  elif is_str(iter) do
         \\    @str_send(iter)
@@ -33,13 +37,9 @@ const stdlib = .{
         \\
     ),
     .next = (
-        \\|iter| do
-        \\  [head, tail] = send(iter, null)
-        \\  if tail == null do
-        \\    null
-        \\  else
-        \\    [head, tail]
-        \\  end
+        \\|iter| match send(iter) do
+        \\  ["ok", head, tail] = [head, tail]
+        \\  ["stop", _]        = null
         \\end
         \\
     ),
@@ -866,7 +866,11 @@ pub const Runner = struct {
                         self.allocator.free(stack);
                         return err;
                     };
-                    return try self.createListValue(&.{ head, tail });
+                    return try self.createListValue(&.{
+                        .{ .str = Value.toShort("ok").? },
+                        head,
+                        tail,
+                    });
                 },
                 .no_match => return self.runError(.{ ip, 0 }, "RunError: no match\n", .{}),
             }
@@ -1297,17 +1301,18 @@ pub const Runner = struct {
             const arg = try Value.Cons.expectOne(args);
             const content = try self.expectStr(null, &arg);
 
-            var head: Value = undefined;
-            var tail: Value = undefined;
             if (initCharLen(content)) |char_len| {
-                head = try self.strSlice(arg, content[0..char_len]);
-                tail = try self.strSlice(arg, content[char_len..]);
+                return try self.createListValue(&.{
+                    .{ .str = Value.toShort("ok").? },
+                    try self.strSlice(arg, content[0..char_len]),
+                    try self.strSlice(arg, content[char_len..]),
+                });
             } else {
-                head = .null;
-                tail = .null;
+                return try self.createListValue(&.{
+                    .{ .str = Value.toShort("stop").? },
+                    .null,
+                });
             }
-
-            return try self.createListValue(&.{ head, tail });
         }
 
         fn @"@dict_send"(self: *Runner, args: ?*Value.Cons) anyerror!Value {
@@ -1316,19 +1321,21 @@ pub const Runner = struct {
             const key = arg_iter.next();
             try arg_iter.expectEnd();
 
-            var head: Value = undefined;
-            var tail: Value = undefined;
             if (dict.next(key)) |item| {
-                head = item.obj.toValue();
-                tail = try self.runLambda(
-                    self.stdlib_values.@"@dict_tail",
-                    &.{ dict.obj.toValue(), item.head },
-                );
+                return try self.createListValue(&.{
+                    .{ .str = Value.toShort("ok").? },
+                    item.obj.toValue(),
+                    try self.runLambda(
+                        self.stdlib_values.@"@dict_tail",
+                        &.{ dict.obj.toValue(), item.head },
+                    ),
+                });
             } else {
-                head = .null;
-                tail = .null;
+                return try self.createListValue(&.{
+                    .{ .str = Value.toShort("stop").? },
+                    .null,
+                });
             }
-            return try self.createListValue(&.{ head, tail });
         }
 
         fn @"@str_index"(self: *Runner, args: ?*Value.Cons) anyerror!Value {

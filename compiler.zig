@@ -665,22 +665,51 @@ pub const Compiler = struct {
                 try self.instrs.append(.call);
                 const start = self.stack.size();
                 try self.compilePattern(.{
-                    .data = .{ .list = &.{ .{
-                        .data = .{ .name = "head" },
-                        .location = .{},
-                    }, .{
-                        .data = .{ .name = "tail" },
-                        .location = .{},
-                    } } },
+                    .data = .{ .lists = &.{
+                        .{
+                            .data = .{ .list = &.{.{
+                                .data = .{ .name = "key" },
+                                .location = .{},
+                            }} },
+                            .location = .{},
+                        },
+                        .{
+                            .data = .{ .name = "args" },
+                            .location = .{},
+                        },
+                    } },
                     .location = .{},
                 }, .any, null, start, subject.location);
                 self.stack.entries.shrinkRetainingCapacity(start);
-                try self.instrs.append(.{ .local = start + 1 });
-                try self.instrs.append(.null);
+                try self.instrs.append(.{ .local = start });
+                try self.instrs.append(.{ .short_str = Value.toShort("stop").? });
                 try self.instrs.append(.eq);
                 try self.instrs.append(.null);
 
                 const body_index = self.instrs.items.len;
+
+                try self.instrs.append(.{ .local = start });
+                try self.instrs.append(.{ .pop = start });
+                try self.instrs.append(.{ .short_str = Value.toShort("ok").? });
+                try self.instrs.append(.eq);
+                try self.instrs.append(.{ .jmp_if = 2 });
+                try self.instrs.append(.{ .pop = start });
+                try self.instrs.append(.no_match);
+                try self.compilePattern(.{
+                    .data = .{ .list = &.{
+                        .{
+                            .data = .{ .name = "head" },
+                            .location = .{},
+                        },
+                        .{
+                            .data = .{ .name = "tail" },
+                            .location = .{},
+                        },
+                    } },
+                    .location = .{},
+                }, .list, null, start, subject.location);
+                self.stack.entries.shrinkRetainingCapacity(start);
+
                 try self.instrs.append(.{ .global = .send });
                 try self.instrs.append(.{ .local = start + 1 });
                 try self.instrs.append(.{ .pop = start + 1 });
@@ -712,7 +741,15 @@ pub const Compiler = struct {
                 try self.instrs.append(.null);
 
                 const end_index = self.instrs.items.len;
-                try self.instrs.append(.{ .pop = start + 1 });
+                try self.instrs.append(.{ .pop = start });
+                try self.compilePattern(.{
+                    .data = .{ .list = &.{.{
+                        .data = .{ .name = "value" },
+                        .location = .{},
+                    }} },
+                    .location = .{},
+                }, .list, null, start, subject.location);
+                self.stack.entries.shrinkRetainingCapacity(start);
 
                 self.instrs.items[body_index - 1] = .{ .jmp_if = end_index - body_index };
                 self.instrs.items[end_index - 1] = .{ .jmp_back = end_index - loop_index };
@@ -1113,7 +1150,8 @@ pub const Compiler = struct {
         switch (usage) {
             .returned => {
                 if (self.is_gen) {
-                    try self.instrs.append(.null);
+                    try self.instrs.append(.{ .short_str = Value.toShort("stop").? });
+                    try self.instrs.append(.{ .local = self.stack.size() });
                     try self.instrs.append(.nil);
                     try self.instrs.append(.cons);
                     try self.instrs.append(.cons);
