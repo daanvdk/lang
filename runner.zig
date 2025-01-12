@@ -752,7 +752,19 @@ pub const Runner = struct {
         }
 
         self.printStackTrace();
-        std.debug.print(fmt, args);
+        if (comptime std.mem.indexOf(u8, fmt, ":")) |colon| {
+            comptime var error_style: []const u8 = undefined;
+            if (comptime std.mem.eql(u8, fmt[0..colon], "ParseError")) {
+                error_style = "\x1b[1;33m";
+            } else if (comptime std.mem.eql(u8, fmt[0..colon], "CompileError")) {
+                error_style = "\x1b[1;34m";
+            } else {
+                error_style = "\x1b[1;31m";
+            }
+            std.debug.print(error_style ++ fmt[0..colon] ++ "\x1b[0;2m:\x1b[0m" ++ fmt[colon + 1 ..], args);
+        } else {
+            std.debug.print(fmt, args);
+        }
 
         if (maybe_call) |call| {
             if (spec != null) call.location = .{};
@@ -840,10 +852,9 @@ pub const Runner = struct {
     }
 
     pub fn printStackTrace(self: *Runner) void {
-        std.debug.print("Stacktrace:\n", .{});
         for (self.calls.items) |call| {
             if (call.is_tail_call) {
-                std.debug.print("  ...some calls were optimized out by tail call optimization...\n", .{});
+                std.debug.print("\x1b[2m...some calls were optimized out by tail call optimization...\x1b[0m\n\n", .{});
             }
             if (call.location.index == 0 and call.location.len == 0) {
                 continue;
@@ -871,7 +882,7 @@ pub const Runner = struct {
                 }
             }
 
-            std.debug.print("  File {s} at line {}:\n", .{ call.program.path, line });
+            std.debug.print("\x1b[2mFile \x1b[0;1;34m{s}\x1b[0;2m at line \x1b[0;1;33m{}\x1b[0;2m:\x1b[0m\n", .{ call.program.path, line });
             const start: usize = call.location.index;
             const end: usize = start + call.location.len;
 
@@ -882,13 +893,14 @@ pub const Runner = struct {
                 } else {
                     line_end = content.len;
                 }
-                std.debug.print("    {s}\n", .{content[line_start..line_end]});
 
-                std.debug.print("    ", .{});
-                for (line_start..@min(line_end, end)) |index| {
-                    std.debug.print("{c}", .{@as(u8, if (index < start) ' ' else '^')});
-                }
-                std.debug.print("\n", .{});
+                const mark_start = @max(line_start, start);
+                const mark_end = @min(line_end, end);
+                std.debug.print("  {s}\x1b[1;31m{s}\x1b[0m{s}\n\n", .{
+                    content[line_start..mark_start],
+                    content[mark_start..mark_end],
+                    content[mark_end..line_end],
+                });
 
                 line += 1;
                 line_start = line_end + 1;

@@ -277,7 +277,7 @@ pub const Compiler = struct {
                     try compiler.scope.put(entry.name, entry.info);
                 }
 
-                _ = try compiler.compileMatcher(switch (tag) {
+                _ = compiler.compileMatcher(switch (tag) {
                     .lambda => value.*,
                     .gen => .{
                         .pattern = .{
@@ -293,7 +293,13 @@ pub const Compiler = struct {
                         .expr = value.*,
                     },
                     else => unreachable,
-                }, .list, null, .{}, .returned);
+                }, .list, null, .{}, .returned) catch |err| {
+                    if (err == error.CompileError) {
+                        self.error_reason = compiler.error_reason;
+                        self.error_location = compiler.error_location;
+                    }
+                    return err;
+                };
 
                 var caps = std.StringHashMap(usize).init(self.instrs.allocator);
                 defer caps.deinit();
