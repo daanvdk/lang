@@ -3,7 +3,6 @@ const std = @import("std");
 const Program = @import("program.zig").Program;
 const Instr = @import("instr.zig").Instr;
 const Value = @import("value.zig").Value;
-const parse = @import("parser.zig").parse;
 const Parser = @import("parser.zig").Parser;
 const internal_parse = @import("parser.zig").internal_parse;
 const compile = @import("compiler.zig").compile;
@@ -161,6 +160,7 @@ pub const Runner = struct {
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(*Call) = .{},
     modules: std.StringHashMapUnmanaged(Value) = .{},
+    running_modules: std.StringHashMapUnmanaged(void) = .{},
     last: ?*Value.Obj = null,
     stdlib_values: StdlibValues,
 
@@ -238,6 +238,7 @@ pub const Runner = struct {
         var path_iter = self.modules.keyIterator();
         while (path_iter.next()) |path| self.allocator.free(path.*);
         self.modules.deinit(self.allocator);
+        self.running_modules.deinit(self.allocator);
 
         while (self.last) |obj| {
             self.last = obj.prev;
@@ -341,6 +342,10 @@ pub const Runner = struct {
     pub fn runPath(self: *Runner, path: []const u8) !Value {
         errdefer self.allocator.free(path);
 
+        const running = try self.running_modules.getOrPut(self.allocator, path);
+        if (running.found_existing) return self.runError(null, "RunError: cyclic imports detected\n", .{});
+        defer self.running_modules.removeByPtr(running.key_ptr);
+
         const result = try self.modules.getOrPut(self.allocator, path);
         if (result.found_existing) {
             self.allocator.free(path);
@@ -363,9 +368,71 @@ pub const Runner = struct {
             );
             defer std.posix.munmap(content);
 
-            const expr = try parse(self.allocator, content);
+            var parser = Parser.init(self.allocator, content);
+            const expr = parser.parseModule() catch |err| switch (err) {
+                error.ParseError => {
+                    const token = parser.token.?;
+                    const index = parser.lexer.getIndex(token);
+                    const location = Instr.Location{
+                        .index = @truncate(index),
+                        .len = @truncate(token.content.len),
+                    };
+
+                    var program = Value.Program{
+                        .path = path,
+                        .instrs = &.{},
+                        .data = &.{},
+                        .locations = &.{.{ .offset = 0, .index = 0, .location = location }},
+                    };
+                    var call = Call{
+                        .program = &program,
+                        .offset = undefined,
+                    };
+                    try self.calls.append(self.allocator, &call);
+                    defer _ = self.calls.pop();
+
+                    const err_ = self.runError(.{ program.instrs.ptr + 1, 0 }, "ParseError: ", .{});
+                    parser.printErrorReason();
+                    return err_;
+                },
+                else => return err,
+            };
             defer expr.deinit(self.allocator);
-            break :program try compile(self.allocator, expr);
+
+            var buffer = Buffer.init(self.allocator);
+            defer buffer.deinit();
+
+            var compiler = Compiler.init(&buffer);
+            defer compiler.deinit();
+
+            _ = compiler.compileExpr(expr, .returned) catch |err| switch (err) {
+                error.CompileError => {
+                    var program = Value.Program{
+                        .path = path,
+                        .instrs = &.{},
+                        .data = &.{},
+                        .locations = &.{.{ .offset = 0, .index = 0, .location = compiler.error_location }},
+                    };
+                    var call = Call{
+                        .program = &program,
+                        .offset = undefined,
+                    };
+                    try self.calls.append(self.allocator, &call);
+                    defer _ = self.calls.pop();
+
+                    const err_ = self.runError(.{ program.instrs.ptr + 1, 0 }, "CompileError: ", .{});
+                    compiler.printCompileError();
+                    return err_;
+                },
+                else => return err,
+            };
+
+            const data = try buffer.content.toOwnedSlice();
+            errdefer self.allocator.free(data);
+            const instrs = try compiler.instrs.toOwnedSlice();
+            errdefer self.allocator.free(instrs);
+            const locations = try compiler.locations.toOwnedSlice();
+            break :program .{ .instrs = instrs, .data = data, .locations = locations };
         };
 
         const value = try self.runProgram(path, program);
@@ -481,7 +548,10 @@ pub const Runner = struct {
 
                 .call => {
                     const args = try self.expectList(.{ ip, 1 }, call.stack.pop());
-                    const value = switch (try self.expectCallable(.{ ip, 0 }, call.stack.pop())) {
+                    const callable = try self.expectCallable(.{ ip, 0 }, call.stack.pop());
+
+                    call.location = call.getLocation(ip, 1);
+                    const value = switch (callable) {
                         .builtin => |builtin| try builtin(self, args),
                         .lambda => |lambda| value: {
                             var call_ = Call{
@@ -494,12 +564,11 @@ pub const Runner = struct {
                             call_.stack.appendSliceAssumeCapacity(lambda.stack);
                             call_.stack.appendAssumeCapacity(Value.Cons.toValue(args));
 
-                            const location = self.getLocation(ip, 1);
-                            call.location = location;
-                            defer call.location = .{};
                             break :value try self.run(&call_);
                         },
                     };
+                    call.location = .{};
+
                     try call.stack.append(self.allocator, value);
                 },
                 .tail_call => {
@@ -531,9 +600,9 @@ pub const Runner = struct {
                         const index = try self.expectIndex(.{ ip, 1 }, rhs);
                         var offset: usize = 0;
                         for (0..index) |_| {
-                            offset += initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
+                            offset += initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
                         }
-                        const len = initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
+                        const len = initCharLen(content[offset..]) orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
                         break :char try self.strSlice(lhs, content[offset .. offset + len]);
                     } else switch (lhs) {
                         .obj => |obj| switch (obj.type) {
@@ -541,14 +610,14 @@ pub const Runner = struct {
                                 const index = try self.expectIndex(.{ ip, 1 }, rhs);
                                 var cons = Value.ObjType.cons.detailed(obj);
                                 for (0..index) |_| {
-                                    cons = cons.tail orelse return self.runError(.{ ip, 1 }, "Index out of bounds: {}\n", .{index});
+                                    cons = cons.tail orelse return self.runError(.{ ip, 1 }, "RunError: index out of bounds: {}\n", .{index});
                                 }
                                 break :get cons.head;
                             },
-                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return self.runError(.{ ip, 1 }, "Key error: {}\n", .{rhs}),
-                            else => return self.runError(.{ ip, 0 }, "Expected an indexable value\n", .{}),
+                            .dict => Value.ObjType.dict.detailed(obj).get(rhs) orelse return self.runError(.{ ip, 1 }, "RunError: key not found: {}\n", .{rhs}),
+                            else => return self.runError(.{ ip, 0 }, "RunError: expected an indexable value\n", .{}),
                         },
-                        else => return self.runError(.{ ip, 0 }, "Expected an indexable value\n", .{}),
+                        else => return self.runError(.{ ip, 0 }, "RunError: expected an indexable value\n", .{}),
                     });
                 },
 
@@ -633,9 +702,9 @@ pub const Runner = struct {
                                 }
                             },
                             .dict => Value.ObjType.dict.detailed(obj).get(lhs) != null,
-                            else => return self.runError(.{ ip, 1 }, "Expected a searchable value\n", .{}),
+                            else => return self.runError(.{ ip, 1 }, "RunError: expected a searchable value\n", .{}),
                         },
-                        else => return self.runError(.{ ip, 1 }, "Expected a searchable value\n", .{}),
+                        else => return self.runError(.{ ip, 1 }, "RunError: expected a searchable value\n", .{}),
                     } });
                 },
 
@@ -669,79 +738,62 @@ pub const Runner = struct {
                     };
                     return try self.createListValue(&.{ head, tail });
                 },
-                .no_match => return self.runError(.{ ip, 0 }, "No match\n", .{}),
+                .no_match => return self.runError(.{ ip, 0 }, "RunError: no match\n", .{}),
             }
         }
         self.checkGc();
     }
 
-    fn getLocation(self: *Runner, ip: [*]const Instr, index: usize) Instr.Location {
-        const program = self.calls.items[self.calls.items.len - 1].program;
-        const offset = (@intFromPtr(ip - 1) - @intFromPtr(program.instrs.ptr)) / @sizeOf(Instr);
+    fn runError(self: *Runner, spec: ?LocationSpec, comptime fmt: []const u8, args: anytype) error{RunError} {
+        const maybe_call: ?*Call = if (self.calls.items.len == 0) null else self.calls.items[self.calls.items.len - 1];
 
-        var min_index: usize = 0;
-        var max_index = program.locations.len;
-        while (min_index < max_index) {
-            const mid_index = (min_index + max_index) / 2;
-            const location = program.locations[mid_index];
-
-            if (location.offset < offset or (location.offset == offset and location.index < index)) {
-                min_index = mid_index + 1;
-            } else if (location.offset == offset and location.index == index) {
-                return location.location;
-            } else {
-                max_index = mid_index;
-            }
+        if (maybe_call) |call| {
+            if (spec) |spec_| call.location = @call(.auto, Call.getLocation, .{call} ++ spec_);
         }
 
-        return .{};
-    }
-
-    const LocationSpec = std.meta.Tuple(&.{ [*]const Instr, usize });
-
-    fn runError(self: *Runner, spec: ?LocationSpec, comptime fmt: []const u8, args: anytype) error{RunError} {
-        const location = if (spec) |spec_| @call(.auto, Runner.getLocation, .{self} ++ spec_) else Instr.Location{};
-        const call = self.calls.items[self.calls.items.len - 1];
-        call.location = location;
         self.printStackTrace();
         std.debug.print(fmt, args);
-        call.location = .{};
+
+        if (maybe_call) |call| {
+            if (spec != null) call.location = .{};
+        }
+
         return error.RunError;
     }
 
     pub fn wrapError(self: *Runner, result: anytype) Error!@typeInfo(@TypeOf(result)).ErrorUnion.payload {
         return result catch |err| return switch (@as(anyerror, err)) {
             error.RunError => error.RunError,
-            else => self.runError(null, "{s}\n", .{@errorName(err)}),
+            else => self.runError(null, "RunError: {s}\n", .{@errorName(err)}),
         };
     }
 
     pub fn expectNum(self: *Runner, spec: ?LocationSpec, value: Value) Error!f64 {
         return switch (value) {
             .num => |num| num,
-            else => self.runError(spec, "Expected a number\n", .{}),
+            else => self.runError(spec, "RunError: expected a number\n", .{}),
         };
     }
 
     pub fn expectIndex(self: *Runner, spec: ?LocationSpec, value: Value) Error!usize {
         const num = try self.expectNum(spec, value);
         if (num < 0 or num != std.math.round(num)) {
-            return self.runError(spec, "Expected a positive integer\n", .{});
+            return self.runError(spec, "RunError: expected a positive integer\n", .{});
         }
         return @intFromFloat(num);
     }
 
     pub fn expectStr(self: *Runner, spec: ?LocationSpec, value: *const Value) Error![]const u8 {
-        return value.toStr() orelse self.runError(spec, "Expected a string\n", .{});
+        return value.toStr() orelse self.runError(spec, "RunError: expected a string\n", .{});
     }
 
     pub fn expectCons(self: *Runner, spec: ?LocationSpec, value: Value) Error!*Value.Cons {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
-                else => self.runError(spec, "Expected a non empty list\n", .{}),
+                else => self.runError(spec, "RunError: expected a non empty list\n", .{}),
             },
-            else => self.runError(spec, "Expected a non empty list\n", .{}),
+            else => self.runError(spec, "RunError: expected a non empty list\n", .{}),
         };
     }
 
@@ -749,9 +801,9 @@ pub const Runner = struct {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .dict => @fieldParentPtr("obj", obj),
-                else => self.runError(spec, "Expected a dictionary\n", .{}),
+                else => self.runError(spec, "RunError: expected a dictionary\n", .{}),
             },
-            else => self.runError(spec, "Expected a dictionary\n", .{}),
+            else => self.runError(spec, "RunError: expected a dictionary\n", .{}),
         };
     }
 
@@ -759,9 +811,9 @@ pub const Runner = struct {
         return switch (value) {
             .obj => |obj| switch (obj.type) {
                 .lambda => @fieldParentPtr("obj", obj),
-                else => self.runError(spec, "Expected a function\n", .{}),
+                else => self.runError(spec, "RunError: expected a function\n", .{}),
             },
-            else => self.runError(spec, "Expected a function\n", .{}),
+            else => self.runError(spec, "RunError: expected a function\n", .{}),
         };
     }
 
@@ -770,9 +822,9 @@ pub const Runner = struct {
             .nil => null,
             .obj => |obj| switch (obj.type) {
                 .cons => @fieldParentPtr("obj", obj),
-                else => self.runError(spec, "Expected a list\n", .{}),
+                else => self.runError(spec, "RunError: expected a list\n", .{}),
             },
-            else => self.runError(spec, "Expected a list\n", .{}),
+            else => self.runError(spec, "RunError: expected a list\n", .{}),
         };
     }
 
@@ -781,9 +833,9 @@ pub const Runner = struct {
             .builtin => |builtin| .{ .builtin = builtin },
             .obj => |obj| switch (obj.type) {
                 .lambda => .{ .lambda = @fieldParentPtr("obj", obj) },
-                else => self.runError(spec, "Expected a lambda function\n", .{}),
+                else => self.runError(spec, "RunError: expected a lambda function\n", .{}),
             },
-            else => self.runError(spec, "Expected a lambda function\n", .{}),
+            else => self.runError(spec, "RunError: expected a lambda function\n", .{}),
         };
     }
 
@@ -793,7 +845,9 @@ pub const Runner = struct {
             if (call.is_tail_call) {
                 std.debug.print("  ...some calls were optimized out by tail call optimization...\n", .{});
             }
-            if (call.location.index == 0 and call.location.len == 0) continue;
+            if (call.location.index == 0 and call.location.len == 0) {
+                continue;
+            }
 
             const file = std.fs.cwd().openFile(call.program.path, .{}) catch continue;
             defer file.close();
@@ -853,7 +907,30 @@ pub const Runner = struct {
         stack: std.ArrayListUnmanaged(Value) = .{},
         location: Instr.Location = .{},
         is_tail_call: bool = false,
+
+        fn getLocation(self: *Call, ip: [*]const Instr, index: usize) Instr.Location {
+            const offset = (@intFromPtr(ip - 1) - @intFromPtr(self.program.instrs.ptr)) / @sizeOf(Instr);
+
+            var min_index: usize = 0;
+            var max_index = self.program.locations.len;
+            while (min_index < max_index) {
+                const mid_index = (min_index + max_index) / 2;
+                const location = self.program.locations[mid_index];
+
+                if (location.offset < offset or (location.offset == offset and location.index < index)) {
+                    min_index = mid_index + 1;
+                } else if (location.offset == offset and location.index == index) {
+                    return location.location;
+                } else {
+                    max_index = mid_index;
+                }
+            }
+
+            return .{};
+        }
     };
+
+    const LocationSpec = std.meta.Tuple(&.{ [*]const Instr, usize });
 
     const Builtins = struct {
         fn is_num(_: *Runner, args: ?*Value.Cons) anyerror!Value {
@@ -1042,7 +1119,7 @@ pub const Runner = struct {
                 };
             }
 
-            return self.runError(null, "Module not found: {s}\n", .{import_path});
+            return self.runError(null, "RunError: module not found: {s}\n", .{import_path});
         }
     };
 

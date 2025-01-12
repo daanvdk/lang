@@ -28,16 +28,18 @@ pub const Parser = struct {
     skip_newlines: bool = false,
     is_gen: bool = false,
 
+    error_reason: enum { unexpected_token, invalid_float, duplicate_fn_name } = undefined,
+
     pub const Error = std.mem.Allocator.Error || error{ParseError};
 
-    fn init(allocator: std.mem.Allocator, content: []const u8) Parser {
+    pub fn init(allocator: std.mem.Allocator, content: []const u8) Parser {
         return .{
             .allocator = allocator,
             .lexer = Lexer.init(content),
         };
     }
 
-    fn parseModule(self: *Parser) Error!Expr {
+    pub fn parseModule(self: *Parser) Error!Expr {
         const start = self.getStart();
         var fn_names = std.StringHashMap(void).init(self.allocator);
         defer fn_names.deinit();
@@ -64,8 +66,8 @@ pub const Parser = struct {
                 const result = try fn_names.getOrPut(token.content);
 
                 if (result.found_existing) {
-                    const pos = self.lexer.getPos(token);
-                    std.debug.print("{}:{}: duplicate fn name {s}\n", .{ pos.line, pos.column, token.content });
+                    self.token = token;
+                    self.error_reason = .duplicate_fn_name;
                     return error.ParseError;
                 }
 
@@ -555,7 +557,10 @@ pub const Parser = struct {
     fn parseNum(self: *Parser) Error!Expr {
         const start = self.getStart();
         const token = try self.expect(&.{.num});
-        const value = std.fmt.parseFloat(f64, token.content) catch return error.ParseError;
+        const value = std.fmt.parseFloat(f64, token.content) catch {
+            self.error_reason = .invalid_float;
+            return error.ParseError;
+        };
         const location = self.getLocation(start);
         return .{ .data = .{ .num = value }, .location = location };
     }
@@ -1062,35 +1067,44 @@ pub const Parser = struct {
     fn expect(self: *Parser, token_types: []const Token.Type) !Token {
         if (self.skip(token_types)) |token| return token;
 
-        const token = self.token.?;
-
-        const pos = self.lexer.getPos(token);
-        std.debug.print("{}:{}: ", .{ pos.line, pos.column });
-
-        if (token.type == .unknown) {
-            std.debug.print("unknown token: {s}\n", .{token.content});
-        } else {
-            std.debug.print("got {s}, expected ", .{@tagName(token.type)});
-            const n = self.expected.count();
-            if (n == 0) {
-                std.debug.print("nothing", .{});
-            } else {
-                var iter = self.expected.iterator();
-                for (0..n) |i| {
-                    if (i == 0) {
-                        // no prefix
-                    } else if (i == n - 1) {
-                        std.debug.print(" or ", .{});
-                    } else {
-                        std.debug.print(", ", .{});
-                    }
-                    std.debug.print("{s}", .{@tagName(iter.next().?)});
-                }
-            }
-            std.debug.print("\n", .{});
-        }
-
+        self.error_reason = .unexpected_token;
         return error.ParseError;
+    }
+
+    pub fn printErrorReason(self: *Parser) void {
+        const token = self.token.?;
+        switch (self.error_reason) {
+            .unexpected_token => {
+                if (token.type == .unknown) {
+                    std.debug.print("unknown token: {s}\n", .{token.content});
+                } else {
+                    std.debug.print("got {s}, expected ", .{@tagName(token.type)});
+                    const n = self.expected.count();
+                    if (n == 0) {
+                        std.debug.print("nothing", .{});
+                    } else {
+                        var iter = self.expected.iterator();
+                        for (0..n) |i| {
+                            if (i == 0) {
+                                // no prefix
+                            } else if (i == n - 1) {
+                                std.debug.print(" or ", .{});
+                            } else {
+                                std.debug.print(", ", .{});
+                            }
+                            std.debug.print("{s}", .{@tagName(iter.next().?)});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                }
+            },
+            .invalid_float => {
+                std.debug.print("cannot convert to float\n", .{});
+            },
+            .duplicate_fn_name => {
+                std.debug.print("duplicate fn name\n", .{});
+            },
+        }
     }
 
     fn getStart(self: *Parser) usize {

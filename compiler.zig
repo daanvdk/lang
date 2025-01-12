@@ -52,6 +52,11 @@ pub const Compiler = struct {
     caps: std.ArrayList(Cap),
     is_gen: bool = false,
 
+    error_reason: union(enum) {
+        unknown_name: []const u8,
+    } = undefined,
+    error_location: Instr.Location = undefined,
+
     pub const Error = std.mem.Allocator.Error || error{CompileError};
 
     pub fn init(buffer: *Buffer) Compiler {
@@ -71,6 +76,12 @@ pub const Compiler = struct {
         self.stack.deinit();
         self.scope.deinit();
         self.caps.deinit();
+    }
+
+    pub fn printCompileError(self: *Compiler) void {
+        switch (self.error_reason) {
+            .unknown_name => |name| std.debug.print("unknown name: {s}\n", .{name}),
+        }
     }
 
     pub fn compileExpr(self: *Compiler, expr: Expr, usage: Usage) Error!Info {
@@ -99,7 +110,8 @@ pub const Compiler = struct {
                         break;
                     }
                 } else {
-                    std.debug.print("unknown name: {s}\n", .{name});
+                    self.error_reason = .{ .unknown_name = name };
+                    self.error_location = expr.location;
                     return error.CompileError;
                 }
                 try self.compileUsage(usage);
