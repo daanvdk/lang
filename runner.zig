@@ -428,7 +428,7 @@ pub const Runner = struct {
                 },
                 .long_str => |str| {
                     const content = call.program.data[str.index .. str.index + str.len];
-                    const value = try self.createValue(.str, .{ .content = content, .source = .{ .data = call.program } });
+                    const value = try self.createValue(.str, .{ .content = content, .source = .{ .slice = &call.program.obj } });
                     try call.stack.append(self.allocator, value);
                 },
 
@@ -1057,7 +1057,7 @@ pub const Runner = struct {
         return try self.createValue(.str, .{
             .content = content,
             .source = switch (str.source) {
-                .alloc => .{ .slice = str },
+                .alloc => .{ .slice = &str.obj },
                 else => str.source,
             },
         });

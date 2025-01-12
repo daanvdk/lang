@@ -738,7 +738,7 @@ pub const Value = union(enum) {
 
         pub fn mark(self: *Str) void {
             switch (self.source) {
-                inline .slice, .data => |value| value.obj.mark(),
+                .slice => |obj| obj.mark(),
                 else => {},
             }
         }
@@ -756,9 +756,8 @@ pub const Value = union(enum) {
         }
 
         pub const Source = union(enum) {
-            data: *Program,
             alloc,
-            slice: *Str,
+            slice: *Obj,
         };
     };
 
