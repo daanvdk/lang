@@ -32,13 +32,7 @@ pub const Expr = struct {
         add: *const Bin,
         sub: *const Bin,
 
-        eq: *const Bin,
-        ne: *const Bin,
-        lt: *const Bin,
-        le: *const Bin,
-        gt: *const Bin,
-        ge: *const Bin,
-        in: *const Bin,
+        cmp: *const CmpRoot,
 
         not: *const Expr,
         @"and": *const Bin,
@@ -155,6 +149,70 @@ pub const Expr = struct {
         pub fn usesName(self: Bin, name: []const u8) bool {
             return self.lhs.usesName(name) or self.rhs.usesName(name);
         }
+    };
+
+    pub const CmpRoot = struct {
+        lhs: Expr,
+        cmps: []const Cmp,
+        last_op: Cmp.Op,
+        last_rhs: Expr,
+
+        pub fn deinit(self: CmpRoot, allocator: std.mem.Allocator) void {
+            self.lhs.deinit(allocator);
+            for (self.cmps) |op| op.deinit(allocator);
+            allocator.free(self.cmps);
+            self.last_rhs.deinit(allocator);
+        }
+
+        pub fn clone(self: CmpRoot, allocator: std.mem.Allocator) std.mem.Allocator.Error!CmpRoot {
+            var copy = self;
+
+            copy.lhs = try self.lhs.clone(allocator);
+            errdefer copy.lhs.deinit(allocator);
+
+            const cmps = try allocator.alloc(Cmp, self.cmps.len);
+            var i: usize = 0;
+            errdefer {
+                allocator.free(cmps);
+                for (cmps[0..i]) |cmp| cmp.deinit(allocator);
+            }
+            while (i < cmps.len) : (i += 1) {
+                cmps[i] = try self.cmps[i].clone(allocator);
+            }
+            copy.cmps = cmps;
+
+            copy.last_rhs = try self.last_rhs.clone(allocator);
+
+            return copy;
+        }
+
+        pub fn usesName(self: CmpRoot, name: []const u8) bool {
+            if (self.lhs.usesName(name)) return true;
+            for (self.cmps) |op| if (op.usesName(name)) return true;
+            return false;
+        }
+    };
+
+    pub const Cmp = struct {
+        op: Op,
+        rhs: Expr,
+
+        pub fn deinit(self: Cmp, allocator: std.mem.Allocator) void {
+            self.rhs.deinit(allocator);
+        }
+
+        pub fn clone(self: Cmp, allocator: std.mem.Allocator) std.mem.Allocator.Error!Cmp {
+            var copy = self;
+            copy.rhs = try self.rhs.clone(allocator);
+            errdefer copy.rhs.deinit(allocator);
+            return copy;
+        }
+
+        pub fn usesName(self: Cmp, name: []const u8) bool {
+            return self.rhs.usesName(name);
+        }
+
+        pub const Op = enum { eq, ne, lt, le, gt, ge, in };
     };
 
     pub const Match = struct {

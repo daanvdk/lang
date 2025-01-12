@@ -326,7 +326,7 @@ pub const Compiler = struct {
                 try self.compileUsage(usage);
                 return .any;
             },
-            inline .call, .get, .pow, .mul, .div, .add, .sub, .eq, .ne, .lt, .le, .gt, .ge, .in => |bin, tag| {
+            inline .call, .get, .pow, .mul, .div, .add, .sub => |bin, tag| {
                 _ = try self.compileExpr(bin.lhs, .used);
                 try self.stack.push(null);
                 _ = try self.compileExpr(bin.rhs, .used);
@@ -346,6 +346,65 @@ pub const Compiler = struct {
                 try self.appendLocation(expr_ptr.location);
                 try self.instrs.append(@field(Instr, @tagName(tag)));
                 try self.compileUsage(usage);
+                return .any;
+            },
+            .cmp => |cmp_root| {
+                _ = try self.compileExpr(cmp_root.lhs, .used);
+
+                var to_end = std.ArrayList(usize).init(self.instrs.allocator);
+                defer to_end.deinit();
+
+                var lhs_location = cmp_root.lhs.location;
+
+                for (cmp_root.cmps) |cmp| {
+                    try self.stack.push(null);
+                    _ = try self.compileExpr(cmp.rhs, .used);
+                    self.stack.pop();
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.instrs.append(.{ .pop = self.stack.size() });
+                    try self.instrs.append(.{ .local = self.stack.size() });
+                    try self.appendLocation(lhs_location);
+                    try self.appendLocation(cmp.rhs.location);
+                    try self.instrs.append(switch (cmp_root.last_op) {
+                        inline else => |tag| @field(Instr, @tagName(tag)),
+                    });
+
+                    switch (usage) {
+                        .returned => {
+                            try self.instrs.append(.null);
+                            const ret_start = self.instrs.items.len;
+                            try self.instrs.append(.{ .bool = false });
+                            try self.compileUsage(usage);
+                            self.instrs.items[ret_start - 1] = .{ .jmp_if = self.instrs.items.len - ret_start };
+                        },
+                        .used => {
+                            try self.instrs.append(.{ .jmp_if = 3 });
+                            try self.instrs.append(.{ .pop = self.stack.size() });
+                            try self.instrs.append(.{ .bool = false });
+                            try to_end.append(self.instrs.items.len);
+                            try self.instrs.append(.null);
+                        },
+                        .ignored => {
+                            try self.instrs.append(.{ .jmp_if = 2 });
+                            try self.instrs.append(.{ .pop = self.stack.size() });
+                            try to_end.append(self.instrs.items.len);
+                            try self.instrs.append(.null);
+                        },
+                    }
+
+                    lhs_location = cmp.rhs.location;
+                }
+
+                _ = try self.compileExpr(cmp_root.last_rhs, .used);
+                try self.appendLocation(lhs_location);
+                try self.appendLocation(cmp_root.last_rhs.location);
+                try self.instrs.append(switch (cmp_root.last_op) {
+                    inline else => |tag| @field(Instr, @tagName(tag)),
+                });
+                try self.compileUsage(usage);
+
+                for (to_end.items) |index| self.instrs.items[index] = .{ .jmp = self.instrs.items.len - 1 - index };
+
                 return .any;
             },
             .@"and" => |bin| {

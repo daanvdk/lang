@@ -282,24 +282,46 @@ pub const Parser = struct {
         const start = self.getStart();
         const result = try self.parseAdd(parse_type);
         if (!parse_type.isExpr(result)) return result;
-        const op = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge, .in }) orelse return result;
+        const token = self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge, .in }) orelse return result;
 
         const lhs = parse_type.toExpr(self.allocator, result);
         errdefer lhs.deinit(self.allocator);
 
-        const rhs = try self.parseAdd(.expr);
-        errdefer rhs.deinit(self.allocator);
+        var last_op = switch (token.type) {
+            inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @field(Expr.Cmp.Op, @tagName(tag)),
+            else => unreachable,
+        };
+        var last_rhs = try self.parseAdd(.expr);
+        errdefer last_rhs.deinit(self.allocator);
 
-        const bin = try self.allocator.create(Expr.Bin);
-        bin.* = .{ .lhs = lhs, .rhs = rhs };
-        const location = self.getLocation(start);
-        return parse_type.fromExpr(.{
-            .data = switch (op.type) {
-                inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @unionInit(Expr.Data, @tagName(tag), bin),
+        var cmps = std.ArrayList(Expr.Cmp).init(self.allocator);
+        defer {
+            for (cmps.items) |op| op.deinit(self.allocator);
+            cmps.deinit();
+        }
+        while (self.skip(&.{ .eq, .ne, .lt, .le, .gt, .ge, .in })) |token_| {
+            const op = switch (token_.type) {
+                inline .eq, .ne, .lt, .le, .gt, .ge, .in => |tag| @field(Expr.Cmp.Op, @tagName(tag)),
                 else => unreachable,
-            },
-            .location = location,
-        });
+            };
+            const rhs = try self.parseAdd(.expr);
+            errdefer rhs.deinit(self.allocator);
+
+            try cmps.append(.{ .op = last_op, .rhs = last_rhs });
+            last_op = op;
+            last_rhs = rhs;
+        }
+
+        const cmp_root = try self.allocator.create(Expr.CmpRoot);
+        errdefer self.allocator.destroy(cmp_root);
+        cmp_root.* = .{
+            .lhs = lhs,
+            .cmps = try cmps.toOwnedSlice(),
+            .last_op = last_op,
+            .last_rhs = last_rhs,
+        };
+        const location = self.getLocation(start);
+        return parse_type.fromExpr(.{ .data = .{ .cmp = cmp_root }, .location = location });
     }
 
     fn parseAdd(self: *Parser, comptime parse_type: ParseType) Error!parse_type.Result() {
